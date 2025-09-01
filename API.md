@@ -276,6 +276,8 @@
   - `PIN_POST` 置顶帖子
   - `FEATURE_POST` 精选帖子
   - `MANAGE_ANNOUNCEMENTS` 公告管理
+  - `MANAGE_COMMENTS` 评论管理
+  - `MANAGE_TAGS` 标签和兑换码管理
 
 ## 示例（curl）
 
@@ -388,3 +390,226 @@ curl -X POST http://localhost:8000/api/announcements \
 - 认证: 是（`MANAGE_COMMENTS` 或超管）
 - 查询: `post_id`, `user_id`, `status(0|1)`, `page`, `page_size`
 - 说明: 评论管理分页列表。
+
+## 标签系统（Tag System）
+
+实体字段（主要）:
+
+**Tag（标签）**:
+- `id` `string` UUID
+- `name` `string` 唯一标识名
+- `title` `string` 显示标题
+- `background_color` `string` 背景色 (#RRGGBB)
+- `text_color` `string` 文字色 (#RRGGBB)
+- `description` `string|null` 描述
+- `is_active` `bool` 是否启用
+- `created_at/updated_at/deleted_at`
+
+**RedemptionCode（兑换码）**:
+- `id` `string` UUID
+- `code` `string` 兑换码（格式: XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XX）
+- `tag_id` `string` 关联标签
+- `is_used` `bool` 是否已使用
+- `used_by` `string|null` 使用者ID
+- `used_at` `datetime|null` 使用时间
+- `expires_at` `datetime|null` 过期时间
+- `batch_id` `string|null` 批次ID
+- `created_at/updated_at/deleted_at`
+
+**UserTag（用户标签）**:
+- `id` `string` UUID
+- `user_id` `string` 用户ID
+- `tag_id` `string` 标签ID
+- `obtained_at` `datetime` 获得时间
+- `is_active` `bool` 是否为当前活跃标签
+- `created_at/updated_at/deleted_at`
+
+### 标签列表（公开）
+- 方法: `GET`
+- 路径: `/api/tags`
+- 查询参数: `active`=`true|false`, `page`, `page_size`
+- 说明: 公开浏览所有可用标签
+
+### 标签详情
+- 方法: `GET`
+- 路径: `/api/tags/{id}`
+- 认证: 是
+
+### 创建标签（管理员）
+- 方法: `POST`
+- 路径: `/api/tags`
+- 认证: 是（`MANAGE_TAGS`）
+- Body:
+```json
+{
+  "name": "vip",
+  "title": "VIP用户",
+  "background_color": "#FFD700",
+  "text_color": "#000000",
+  "description": "VIP尊贵用户标识"
+}
+```
+
+### 更新标签（管理员）
+- 方法: `PUT`
+- 路径: `/api/tags/{id}`
+- 认证: 是（`MANAGE_TAGS`）
+- Body（字段可选）:
+```json
+{
+  "title": "超级VIP",
+  "background_color": "#FF6B6B",
+  "is_active": true
+}
+```
+
+### 删除标签（管理员）
+- 方法: `DELETE`
+- 路径: `/api/tags/{id}`
+- 认证: 是（`MANAGE_TAGS`）
+- 说明: 软删除，设置 `deleted_at`
+
+### 生成兑换码（管理员）
+- 方法: `POST`
+- 路径: `/api/tags/generate-codes`
+- 认证: 是（`MANAGE_TAGS`）
+- Body:
+```json
+{
+  "tag_id": "uuid-of-tag",
+  "count": 100,
+  "expires_at": "2024-12-31T23:59:59Z"
+}
+```
+- 成功响应:
+```json
+{
+  "success": true,
+  "data": {
+    "batch_id": "BATCH_1703980800_ABCD1234",
+    "tag": { "id": "...", "name": "vip", "title": "VIP用户" },
+    "count": 100,
+    "codes": [
+      {
+        "id": "...",
+        "code": "ABCD-EFGH-IJKL-MNOP-QRST-UVWX-YZ",
+        "tag_id": "...",
+        "is_used": false,
+        "expires_at": "2024-12-31T23:59:59Z",
+        "batch_id": "BATCH_1703980800_ABCD1234",
+        "created_at": "..."
+      }
+    ]
+  }
+}
+```
+
+### 兑换码列表（管理员）
+- 方法: `GET`
+- 路径: `/api/redemption-codes`
+- 认证: 是（`MANAGE_TAGS`）
+- 查询参数: `tag_id`, `batch_id`, `used`=`true|false`, `page`, `page_size`
+
+### 兑换码（用户）
+- 方法: `POST`
+- 路径: `/api/redeem`
+- 认证: 是
+- Body:
+```json
+{
+  "code": "ABCD-EFGH-IJKL-MNOP-QRST-UVWX-YZ"
+}
+```
+- 成功响应:
+```json
+{
+  "success": true,
+  "data": {
+    "success": true,
+    "message": "Tag redeemed successfully",
+    "user_tag": {
+      "id": "...",
+      "user_id": "...",
+      "tag_id": "...",
+      "obtained_at": "...",
+      "is_active": true,
+      "tag": {
+        "name": "vip",
+        "title": "VIP用户",
+        "background_color": "#FFD700",
+        "text_color": "#000000"
+      }
+    }
+  }
+}
+```
+
+### 我的标签列表
+- 方法: `GET`
+- 路径: `/api/my/tags`
+- 认证: 是
+- 说明: 获取当前用户拥有的所有标签
+
+### 设置活跃标签
+- 方法: `POST`
+- 路径: `/api/my/tags/{tag_id}/activate`
+- 认证: 是
+- 说明: 设置某个标签为当前活跃显示标签（一次只能激活一个）
+
+### 带标签的响应示例
+
+**帖子列表带用户标签**:
+```json
+{
+  "success": true,
+  "data": {
+    "total": 10,
+    "items": [
+      {
+        "id": "post-uuid",
+        "author_id": "user-uuid",
+        "author_name": "匿名用户",
+        "target_name": "小明",
+        "content": "表白内容...",
+        "image_path": "/uploads/image.jpg",
+        "status": 0,
+        "is_pinned": false,
+        "is_featured": true,
+        "created_at": "2024-01-01T12:00:00Z",
+        "author_tag": {
+          "name": "vip",
+          "title": "VIP用户",
+          "background_color": "#FFD700",
+          "text_color": "#000000"
+        }
+      }
+    ]
+  }
+}
+```
+
+**评论列表带用户标签**:
+```json
+{
+  "success": true,
+  "data": {
+    "total": 5,
+    "items": [
+      {
+        "id": "comment-uuid",
+        "post_id": "post-uuid",
+        "user_id": "user-uuid",
+        "content": "评论内容...",
+        "status": 0,
+        "created_at": "2024-01-01T12:30:00Z",
+        "user_tag": {
+          "name": "member",
+          "title": "会员",
+          "background_color": "#4CAF50",
+          "text_color": "#FFFFFF"
+        }
+      }
+    ]
+  }
+}
+```

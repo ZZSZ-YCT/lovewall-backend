@@ -35,6 +35,12 @@ func (h *AdminHandler) SetUserPermissions(c *gin.Context) {
         return
     }
     id := c.Param("id")
+    // Check if user exists
+    var user model.User
+    if err := h.db.First(&user, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
+        basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
+        return
+    }
     var body permBody
     if err := c.ShouldBindJSON(&body); err != nil { basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid body"); return }
     // sanitize
@@ -48,7 +54,8 @@ func (h *AdminHandler) SetUserPermissions(c *gin.Context) {
         perms = append(perms, p)
     }
     tx := h.db.Begin()
-    if err := tx.Where("user_id = ?", id).Delete(&model.UserPermission{}).Error; err != nil { tx.Rollback(); basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed"); return }
+    // Use Unscoped to permanently delete old permissions for this operation
+    if err := tx.Unscoped().Where("user_id = ?", id).Delete(&model.UserPermission{}).Error; err != nil { tx.Rollback(); basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed"); return }
     for _, p := range perms {
         up := model.UserPermission{BaseModel: model.BaseModel{ID: uuid.NewString()}, UserID: id, Permission: p}
         if err := tx.Create(&up).Error; err != nil { tx.Rollback(); basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed"); return }

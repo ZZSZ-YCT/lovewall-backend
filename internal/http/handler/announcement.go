@@ -2,6 +2,7 @@ package handler
 
 import (
     "net/http"
+    "time"
 
     "github.com/gin-gonic/gin"
     "github.com/google/uuid"
@@ -64,11 +65,18 @@ func (h *AnnouncementHandler) Update(c *gin.Context) {
 
 func (h *AnnouncementHandler) Delete(c *gin.Context) {
     id := c.Param("id")
-    // soft delete by setting deleted_at if you want; here keep simple: set is_active false
-    if err := h.db.Model(&model.Announcement{}).Where("id = ?", id).Update("is_active", false).Error; err != nil {
+    // Check if announcement exists
+    var a model.Announcement
+    if err := h.db.First(&a, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
+        basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "announcement not found")
+        return
+    }
+    // Soft delete by setting deleted_at
+    now := time.Now()
+    if err := h.db.Model(&model.Announcement{}).Where("id = ?", id).Update("deleted_at", now).Error; err != nil {
         basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
         return
     }
-    basichttp.OK(c, gin.H{"id": id, "is_active": false})
+    basichttp.OK(c, gin.H{"id": id, "deleted": true})
 }
 

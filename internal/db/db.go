@@ -36,6 +36,9 @@ func AutoMigrate(db *gorm.DB) error {
         &model.Comment{},
         &model.Announcement{},
         &model.UserPermission{},
+        &model.Tag{},
+        &model.RedemptionCode{},
+        &model.UserTag{},
     )
 }
 

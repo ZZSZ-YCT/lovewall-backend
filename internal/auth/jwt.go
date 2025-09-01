@@ -27,3 +27,16 @@ func Sign(secret, sub string, isSuper bool, ttlSeconds int64) (string, error) {
     return token.SignedString([]byte(secret))
 }
 
+func Parse(secret, tokenStr string) (*Claims, error) {
+    token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+        return []byte(secret), nil
+    })
+    if err != nil {
+        return nil, err
+    }
+    if claims, ok := token.Claims.(*Claims); ok && token.Valid {
+        return claims, nil
+    }
+    return nil, jwt.ErrInvalidKey
+}
+

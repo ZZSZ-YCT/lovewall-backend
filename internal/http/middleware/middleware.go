@@ -3,6 +3,7 @@ package middleware
 import (
     "net/http"
     "strings"
+    "sync"
     "time"
 
     basichttp "lovewall/internal/http"
@@ -11,6 +12,7 @@ import (
     "github.com/golang-jwt/jwt/v5"
     "go.uber.org/zap"
     "gorm.io/gorm"
+    "golang.org/x/time/rate"
 )
 
 func RequestLogger() gin.HandlerFunc {
@@ -91,7 +93,7 @@ func RequirePerm(db *gorm.DB, perm string) gin.HandlerFunc {
             return
         }
         var count int64
-        db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ?", uidVal, perm).Scan(&count)
+        db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uidVal, perm).Scan(&count)
         if count == 0 {
             basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "permission denied")
             c.Abort()
@@ -123,6 +125,65 @@ func CORS(origins []string) gin.HandlerFunc {
         }
         if c.Request.Method == http.MethodOptions {
             c.AbortWithStatus(http.StatusNoContent)
+            return
+        }
+        c.Next()
+    }
+}
+
+// Rate limiting
+type visitor struct {
+    limiter  *rate.Limiter
+    lastSeen time.Time
+}
+
+type rateLimitStore struct {
+    visitors map[string]*visitor
+    mu       sync.Mutex
+}
+
+func (s *rateLimitStore) addVisitor(ip string, r rate.Limit, b int) *rate.Limiter {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    v, exists := s.visitors[ip]
+    if !exists {
+        limiter := rate.NewLimiter(r, b)
+        s.visitors[ip] = &visitor{limiter, time.Now()}
+        return limiter
+    }
+
+    v.lastSeen = time.Now()
+    return v.limiter
+}
+
+func (s *rateLimitStore) cleanup() {
+    for {
+        time.Sleep(time.Minute)
+        s.mu.Lock()
+        for ip, v := range s.visitors {
+            if time.Since(v.lastSeen) > 3*time.Minute {
+                delete(s.visitors, ip)
+            }
+        }
+        s.mu.Unlock()
+    }
+}
+
+var store = &rateLimitStore{
+    visitors: make(map[string]*visitor),
+}
+
+func init() {
+    go store.cleanup()
+}
+
+func RateLimit(rps int, burst int) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        limiter := store.addVisitor(c.ClientIP(), rate.Limit(rps), burst)
+        if !limiter.Allow() {
+            basichttp.Fail(c, http.StatusTooManyRequests, "RATE_LIMITED", "rate limit exceeded")
+            c.Abort()
             return
         }
         c.Next()

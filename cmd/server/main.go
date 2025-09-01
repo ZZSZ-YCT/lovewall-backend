@@ -36,6 +36,7 @@ func main() {
     r := gin.New()
     r.Use(gin.Recovery())
     r.Use(mw.RequestLogger())
+    r.Use(mw.RateLimit(cfg.RateLimitRPS, cfg.RateLimitBurst))
     if origins := cfg.AllowOrigins; origins != "" {
         r.Use(mw.CORS(strings.Split(origins, ",")))
     }
@@ -58,6 +59,7 @@ func main() {
     annH := handler.NewAnnouncementHandler(database, cfg)
     cmtH := handler.NewCommentHandler(database, cfg)
     adminH := handler.NewAdminHandler(database, cfg)
+    tagH := handler.NewTagHandler(database, cfg)
 
     api.POST("/register", authH.Register)
     api.POST("/login", authH.Login)
@@ -66,6 +68,7 @@ func main() {
     api.GET("/posts/:id", postH.GetPost)
     api.GET("/posts/:id/comments", cmtH.ListForPost)
     api.GET("/announcements", annH.List)
+    api.GET("/tags", tagH.ListTags)
 
     authed := api.Group("")
     authed.Use(mw.RequireAuth(cfg.JWTSecret))
@@ -82,6 +85,7 @@ func main() {
     authed.DELETE("/announcements/:id", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.Delete)
 
     authed.GET("/users", mw.RequirePerm(database, "MANAGE_USERS"), adminH.ListUsers)
+    authed.PUT("/users/:id", authH.UpdateUser)
     authed.POST("/users/:id/permissions", adminH.SetUserPermissions)
 
     authed.POST("/posts/:id/comments", cmtH.Create)
@@ -90,6 +94,19 @@ func main() {
     authed.POST("/comments/:id/hide", mw.RequirePerm(database, "MANAGE_COMMENTS"), cmtH.Hide)
     authed.GET("/my/comments", cmtH.ListMine)
     authed.GET("/comments", mw.RequirePerm(database, "MANAGE_COMMENTS"), cmtH.ListModeration)
+
+    // Tag and Redemption Code APIs
+    authed.POST("/tags", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.CreateTag)
+    authed.PUT("/tags/:id", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.UpdateTag)
+    authed.DELETE("/tags/:id", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.DeleteTag)
+    authed.GET("/tags/:id", tagH.GetTag)
+    
+    authed.POST("/tags/generate-codes", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.GenerateRedemptionCodes)
+    authed.GET("/redemption-codes", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.ListRedemptionCodes)
+    
+    authed.POST("/redeem", tagH.RedeemCode)
+    authed.GET("/my/tags", tagH.ListUserTags)
+    authed.POST("/my/tags/:tag_id/activate", tagH.SetActiveTag)
 
     addr := fmt.Sprintf(":%d", cfg.Port)
     if err := http.ListenAndServe(addr, r); err != nil {

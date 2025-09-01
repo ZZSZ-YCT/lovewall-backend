@@ -12,15 +12,21 @@ import (
     basichttp "lovewall/internal/http"
     mw "lovewall/internal/http/middleware"
     "lovewall/internal/model"
+    "lovewall/internal/service"
 )
 
 type CommentHandler struct {
-    db  *gorm.DB
-    cfg *config.Config
+    db         *gorm.DB
+    cfg        *config.Config
+    tagService *service.UserTagService
 }
 
 func NewCommentHandler(db *gorm.DB, cfg *config.Config) *CommentHandler {
-    return &CommentHandler{db: db, cfg: cfg}
+    return &CommentHandler{
+        db:         db,
+        cfg:        cfg,
+        tagService: service.NewUserTagService(db),
+    }
 }
 
 // GET /api/posts/:id/comments (public)
@@ -44,7 +50,43 @@ func (h *CommentHandler) ListForPost(c *gin.Context) {
         basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
         return
     }
-    basichttp.OK(c, gin.H{"total": total, "items": items, "page": page, "page_size": size})
+    basichttp.OK(c, gin.H{"total": total, "items": h.enrichCommentsWithUserTags(items), "page": page, "page_size": size})
+}
+
+// enrichCommentWithUserTag adds user tag information to comment response
+func (h *CommentHandler) enrichCommentWithUserTag(comment *model.Comment) gin.H {
+    result := gin.H{
+        "id":          comment.ID,
+        "post_id":     comment.PostID,
+        "user_id":     comment.UserID,
+        "content":     comment.Content,
+        "status":      comment.Status,
+        "metadata":    comment.Metadata,
+        "created_at":  comment.CreatedAt,
+        "updated_at":  comment.UpdatedAt,
+        "user_tag":    nil,
+    }
+    
+    // Get user's active tag
+    if tag, err := h.tagService.GetActiveUserTag(comment.UserID); err == nil && tag != nil {
+        result["user_tag"] = gin.H{
+            "name":             tag.Name,
+            "title":            tag.Title,
+            "background_color": tag.BackgroundColor,
+            "text_color":       tag.TextColor,
+        }
+    }
+    
+    return result
+}
+
+// enrichCommentsWithUserTags adds user tag information to multiple comments
+func (h *CommentHandler) enrichCommentsWithUserTags(comments []model.Comment) []gin.H {
+    result := make([]gin.H, 0, len(comments))
+    for i := range comments {
+        result = append(result, h.enrichCommentWithUserTag(&comments[i]))
+    }
+    return result
 }
 
 type createCommentBody struct { Content string `json:"content" binding:"required"` }
@@ -90,13 +132,14 @@ func (h *CommentHandler) Delete(c *gin.Context) {
     if uid != cm.UserID {
         if !mw.IsSuper(c) {
             var cnt int64
-            h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ?", uid, "MANAGE_COMMENTS").Scan(&cnt)
+            h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_COMMENTS").Scan(&cnt)
             if cnt == 0 {
                 basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "no permission")
                 return
             }
         }
     }
+    // Mark as deleted using status=1 (hidden/deleted for comments)
     if err := h.db.Model(&model.Comment{}).Where("id = ?", id).Update("status", 1).Error; err != nil {
         basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
         return
@@ -116,7 +159,7 @@ func (h *CommentHandler) Update(c *gin.Context) {
     if uid != cm.UserID {
         if !mw.IsSuper(c) {
             var cnt int64
-            h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ?", uid, "MANAGE_COMMENTS").Scan(&cnt)
+            h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_COMMENTS").Scan(&cnt)
             if cnt == 0 { basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "no permission"); return }
         }
     } else {
@@ -125,7 +168,7 @@ func (h *CommentHandler) Update(c *gin.Context) {
             // need MANAGE_COMMENTS unless super
             if !mw.IsSuper(c) {
                 var cnt int64
-                h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ?", uid, "MANAGE_COMMENTS").Scan(&cnt)
+                h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_COMMENTS").Scan(&cnt)
                 if cnt == 0 { basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "edit window closed"); return }
             }
         }
@@ -170,7 +213,43 @@ func (h *CommentHandler) ListMine(c *gin.Context) {
         basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
         return
     }
-    basichttp.OK(c, gin.H{"total": total, "items": items, "page": page, "page_size": size})
+    basichttp.OK(c, gin.H{"total": total, "items": h.enrichCommentsWithUserTags(items), "page": page, "page_size": size})
+}
+
+// enrichCommentWithUserTag adds user tag information to comment response
+func (h *CommentHandler) enrichCommentWithUserTag(comment *model.Comment) gin.H {
+    result := gin.H{
+        "id":          comment.ID,
+        "post_id":     comment.PostID,
+        "user_id":     comment.UserID,
+        "content":     comment.Content,
+        "status":      comment.Status,
+        "metadata":    comment.Metadata,
+        "created_at":  comment.CreatedAt,
+        "updated_at":  comment.UpdatedAt,
+        "user_tag":    nil,
+    }
+    
+    // Get user's active tag
+    if tag, err := h.tagService.GetActiveUserTag(comment.UserID); err == nil && tag != nil {
+        result["user_tag"] = gin.H{
+            "name":             tag.Name,
+            "title":            tag.Title,
+            "background_color": tag.BackgroundColor,
+            "text_color":       tag.TextColor,
+        }
+    }
+    
+    return result
+}
+
+// enrichCommentsWithUserTags adds user tag information to multiple comments
+func (h *CommentHandler) enrichCommentsWithUserTags(comments []model.Comment) []gin.H {
+    result := make([]gin.H, 0, len(comments))
+    for i := range comments {
+        result = append(result, h.enrichCommentWithUserTag(&comments[i]))
+    }
+    return result
 }
 
 // GET /api/comments (MANAGE_COMMENTS) moderation list
@@ -190,5 +269,41 @@ func (h *CommentHandler) ListModeration(c *gin.Context) {
         basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
         return
     }
-    basichttp.OK(c, gin.H{"total": total, "items": items, "page": page, "page_size": size})
+    basichttp.OK(c, gin.H{"total": total, "items": h.enrichCommentsWithUserTags(items), "page": page, "page_size": size})
+}
+
+// enrichCommentWithUserTag adds user tag information to comment response
+func (h *CommentHandler) enrichCommentWithUserTag(comment *model.Comment) gin.H {
+    result := gin.H{
+        "id":          comment.ID,
+        "post_id":     comment.PostID,
+        "user_id":     comment.UserID,
+        "content":     comment.Content,
+        "status":      comment.Status,
+        "metadata":    comment.Metadata,
+        "created_at":  comment.CreatedAt,
+        "updated_at":  comment.UpdatedAt,
+        "user_tag":    nil,
+    }
+    
+    // Get user's active tag
+    if tag, err := h.tagService.GetActiveUserTag(comment.UserID); err == nil && tag != nil {
+        result["user_tag"] = gin.H{
+            "name":             tag.Name,
+            "title":            tag.Title,
+            "background_color": tag.BackgroundColor,
+            "text_color":       tag.TextColor,
+        }
+    }
+    
+    return result
+}
+
+// enrichCommentsWithUserTags adds user tag information to multiple comments
+func (h *CommentHandler) enrichCommentsWithUserTags(comments []model.Comment) []gin.H {
+    result := make([]gin.H, 0, len(comments))
+    for i := range comments {
+        result = append(result, h.enrichCommentWithUserTag(&comments[i]))
+    }
+    return result
 }

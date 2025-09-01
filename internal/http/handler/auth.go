@@ -44,13 +44,22 @@ func (h *AuthHandler) Register(c *gin.Context) {
         basichttp.Fail(c, http.StatusConflict, "CONFLICT", "username already exists")
         return
     }
-    hashed, _ := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+    hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+    if err != nil {
+        basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "hash password failed")
+        return
+    }
     isSuper := false
     // Superadmin bootstrap: if no users exist or matches ADMIN_INIT_USER
     var userCount int64
     h.db.Model(&model.User{}).Count(&userCount)
     if userCount == 0 {
         if h.cfg.AdminInitUser == "" || h.cfg.AdminInitUser == req.Username {
+            isSuper = true
+        }
+    } else if h.cfg.AdminInitUser != "" && h.cfg.AdminInitUser == req.Username && h.cfg.AdminInitPass != "" {
+        // Allow creating predefined admin even if users exist, but verify password
+        if h.cfg.AdminInitPass == req.Password {
             isSuper = true
         }
     }
@@ -130,7 +139,7 @@ func (h *AuthHandler) Profile(c *gin.Context) {
     }
     // permissions fetch (simple)
     var perms []model.UserPermission
-    h.db.Where("user_id = ?", u.ID).Find(&perms)
+    h.db.Where("user_id = ? AND deleted_at IS NULL", u.ID).Find(&perms)
     pstrs := make([]string, 0, len(perms))
     for _, p := range perms {
         pstrs = append(pstrs, p.Permission)
@@ -155,5 +164,117 @@ func sanitizeUser(u *model.User) gin.H {
         "created_at":    u.CreatedAt,
         "updated_at":    u.UpdatedAt,
     }
+}
+
+type UpdateUserRequest struct {
+    DisplayName *string `json:"display_name"`
+    Email       *string `json:"email"`
+    Phone       *string `json:"phone"`
+    AvatarURL   *string `json:"avatar_url"`
+    Bio         *string `json:"bio"`
+    Password    *string `json:"password"`
+    OldPassword *string `json:"old_password"`
+}
+
+// PUT /api/users/:id (self or MANAGE_USERS)
+func (h *AuthHandler) UpdateUser(c *gin.Context) {
+    userID := c.Param("id")
+    currentUID, _ := c.Get(mw.CtxUserID)
+    
+    // Check permission: self or MANAGE_USERS
+    if userID != currentUID {
+        if !mw.IsSuper(c) {
+            var cnt int64
+            h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", currentUID, "MANAGE_USERS").Scan(&cnt)
+            if cnt == 0 {
+                basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "no permission")
+                return
+            }
+        }
+    }
+    
+    var req UpdateUserRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid payload")
+        return
+    }
+    
+    var user model.User
+    if err := h.db.First(&user, "id = ? AND deleted_at IS NULL", userID).Error; err != nil {
+        basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
+        return
+    }
+    
+    updates := make(map[string]interface{})
+    
+    // Handle password change
+    if req.Password != nil {
+        if userID == currentUID {
+            // Self password change requires old password
+            if req.OldPassword == nil {
+                basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "old password required")
+                return
+            }
+            if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(*req.OldPassword)) != nil {
+                basichttp.Fail(c, http.StatusUnauthorized, "UNAUTHORIZED", "invalid old password")
+                return
+            }
+        }
+        hashed, err := bcrypt.GenerateFromPassword([]byte(*req.Password), bcrypt.DefaultCost)
+        if err != nil {
+            basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "hash password failed")
+            return
+        }
+        updates["password_hash"] = string(hashed)
+    }
+    
+    // Handle other fields
+    if req.DisplayName != nil {
+        updates["display_name"] = req.DisplayName
+    }
+    if req.Email != nil {
+        // Check email uniqueness
+        var count int64
+        h.db.Model(&model.User{}).Where("email = ? AND id != ? AND deleted_at IS NULL", *req.Email, userID).Count(&count)
+        if count > 0 {
+            basichttp.Fail(c, http.StatusConflict, "CONFLICT", "email already exists")
+            return
+        }
+        updates["email"] = req.Email
+    }
+    if req.Phone != nil {
+        // Check phone uniqueness
+        var count int64
+        h.db.Model(&model.User{}).Where("phone = ? AND id != ? AND deleted_at IS NULL", *req.Phone, userID).Count(&count)
+        if count > 0 {
+            basichttp.Fail(c, http.StatusConflict, "CONFLICT", "phone already exists")
+            return
+        }
+        updates["phone"] = req.Phone
+    }
+    if req.AvatarURL != nil {
+        updates["avatar_url"] = req.AvatarURL
+    }
+    if req.Bio != nil {
+        updates["bio"] = req.Bio
+    }
+    
+    if len(updates) == 0 {
+        basichttp.OK(c, sanitizeUser(&user))
+        return
+    }
+    
+    if err := h.db.Model(&user).Updates(updates).Error; err != nil {
+        basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
+        return
+    }
+    
+    // Reload user
+    if err := h.db.First(&user, "id = ?", userID).Error; err != nil {
+        basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "reload failed")
+        return
+    }
+    
+    basichttp.OK(c, sanitizeUser(&user))
 }
 

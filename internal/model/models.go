@@ -77,3 +77,42 @@ type UserPermission struct {
     Permission string `gorm:"index:uniq_user_perm,unique;not null" json:"permission"`
 }
 
+type Tag struct {
+    BaseModel
+    Name            string  `gorm:"not null;uniqueIndex" json:"name"`
+    Title           string  `gorm:"not null" json:"title"`
+    BackgroundColor string  `gorm:"not null" json:"background_color"`
+    TextColor       string  `gorm:"not null" json:"text_color"`
+    Description     *string `json:"description,omitempty"`
+    IsActive        bool    `gorm:"not null;default:true;index" json:"is_active"`
+    Metadata        *string `json:"metadata,omitempty"`
+}
+
+type RedemptionCode struct {
+    BaseModel
+    Code        string     `gorm:"not null;uniqueIndex" json:"code"`
+    TagID       string     `gorm:"index;not null" json:"tag_id"`
+    IsUsed      bool       `gorm:"not null;default:false;index" json:"is_used"`
+    UsedBy      *string    `gorm:"index" json:"used_by,omitempty"`
+    UsedAt      *time.Time `json:"used_at,omitempty"`
+    ExpiresAt   *time.Time `gorm:"index" json:"expires_at,omitempty"`
+    BatchID     *string    `gorm:"index" json:"batch_id,omitempty"`
+    Metadata    *string    `json:"metadata,omitempty"`
+    
+    // Relations
+    Tag  Tag   `gorm:"foreignKey:TagID;references:ID" json:"tag,omitempty"`
+    User *User `gorm:"foreignKey:UsedBy;references:ID" json:"user,omitempty"`
+}
+
+type UserTag struct {
+    BaseModel
+    UserID    string     `gorm:"index:uniq_user_tag,unique;not null" json:"user_id"`
+    TagID     string     `gorm:"index:uniq_user_tag,unique;not null" json:"tag_id"`
+    ObtainedAt time.Time `gorm:"not null;default:current_timestamp" json:"obtained_at"`
+    IsActive   bool      `gorm:"not null;default:true;index" json:"is_active"`
+    
+    // Relations
+    User User `gorm:"foreignKey:UserID;references:ID" json:"user,omitempty"`
+    Tag  Tag  `gorm:"foreignKey:TagID;references:ID" json:"tag,omitempty"`
+}
+

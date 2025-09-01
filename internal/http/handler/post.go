@@ -2,6 +2,7 @@ package handler
 
 import (
     "fmt"
+    "io"
     "net/http"
     "time"
 
@@ -13,25 +14,28 @@ import (
     basichttp "lovewall/internal/http"
     mw "lovewall/internal/http/middleware"
     "lovewall/internal/model"
+    "lovewall/internal/service"
     "lovewall/internal/storage"
 )
 
 type PostHandler struct {
-    db  *gorm.DB
-    cfg *config.Config
+    db         *gorm.DB
+    cfg        *config.Config
+    tagService *service.UserTagService
 }
 
 func NewPostHandler(db *gorm.DB, cfg *config.Config) *PostHandler {
-    return &PostHandler{db: db, cfg: cfg}
+    return &PostHandler{
+        db:         db,
+        cfg:        cfg,
+        tagService: service.NewUserTagService(db),
+    }
 }
 
 type CreatePostForm struct {
-    AuthorName string `form:"author_name" binding:"required"
-json:"author_name"`
-    TargetName string `form:"target_name" binding:"required"
-json:"target_name"`
-    Content    string `form:"content" binding:"required"
-json:"content"`
+    AuthorName string `form:"author_name" binding:"required" json:"author_name"`
+    TargetName string `form:"target_name" binding:"required" json:"target_name"`
+    Content    string `form:"content" binding:"required" json:"content"`
 }
 
 func (h *PostHandler) CreatePost(c *gin.Context) {
@@ -52,7 +56,11 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
             return
         }
         buf := make([]byte, 512)
-        n, _ := file.Read(buf)
+        n, err := file.Read(buf)
+        if err != nil && err != io.EOF {
+            basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "read file failed")
+            return
+        }
         mime := http.DetectContentType(buf[:n])
         if ext := storage.ExtFromMIME(mime); ext == "" {
             basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "unsupported mime")
@@ -60,7 +68,10 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
         } else {
             // rewind
             if seeker, ok := file.(interface{ Seek(int64, int) (int64, error) }); ok {
-                _, _ = seeker.Seek(0, 0)
+                if _, err := seeker.Seek(0, 0); err != nil {
+                    basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "file seek failed")
+                    return
+                }
             }
             lp := &storage.LocalProvider{BaseDir: h.cfg.UploadDir}
             savedName := uuid.NewString() + ext
@@ -115,7 +126,7 @@ func (h *PostHandler) ListPosts(c *gin.Context) {
     }
     basichttp.OK(c, gin.H{
         "total":     total,
-        "items":     items,
+        "items":     h.enrichPostsWithUserTags(items),
         "page":      page,
         "page_size": size,
     })
@@ -128,12 +139,25 @@ func (h *PostHandler) GetPost(c *gin.Context) {
         basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found")
         return
     }
+    // Check visibility: status=0 is public, others need admin permission
     if p.Status != 0 {
-        // Only admins can view hidden/deleted (not wired here); return 404
-        basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found")
-        return
+        uid, hasAuth := c.Get(mw.CtxUserID)
+        if !hasAuth {
+            basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found")
+            return
+        }
+        // Allow if superadmin or has MANAGE_POSTS permission
+        if !mw.IsSuper(c) {
+            var cnt int64
+            h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission IN (?, ?, ?) AND deleted_at IS NULL", 
+                uid, "HIDE_POST", "DELETE_POST", "EDIT_POST").Scan(&cnt)
+            if cnt == 0 {
+                basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found")
+                return
+            }
+        }
     }
-    basichttp.OK(c, p)
+    basichttp.OK(c, h.enrichPostWithUserTag(&p))
 }
 
 func queryInt(c *gin.Context, key string, def int) int {
@@ -147,6 +171,46 @@ func queryInt(c *gin.Context, key string, def int) int {
 }
 
 func since(t time.Time) string { return time.Since(t).String() }
+
+// enrichPostWithUserTag adds user tag information to post response
+func (h *PostHandler) enrichPostWithUserTag(post *model.Post) gin.H {
+    result := gin.H{
+        "id":           post.ID,
+        "author_id":    post.AuthorID,
+        "author_name":  post.AuthorName,
+        "target_name":  post.TargetName,
+        "content":      post.Content,
+        "image_path":   post.ImagePath,
+        "status":       post.Status,
+        "is_pinned":    post.IsPinned,
+        "is_featured":  post.IsFeatured,
+        "metadata":     post.Metadata,
+        "created_at":   post.CreatedAt,
+        "updated_at":   post.UpdatedAt,
+        "author_tag":   nil,
+    }
+    
+    // Get author's active tag
+    if tag, err := h.tagService.GetActiveUserTag(post.AuthorID); err == nil && tag != nil {
+        result["author_tag"] = gin.H{
+            "name":             tag.Name,
+            "title":            tag.Title,
+            "background_color": tag.BackgroundColor,
+            "text_color":       tag.TextColor,
+        }
+    }
+    
+    return result
+}
+
+// enrichPostsWithUserTags adds user tag information to multiple posts
+func (h *PostHandler) enrichPostsWithUserTags(posts []model.Post) []gin.H {
+    result := make([]gin.H, 0, len(posts))
+    for i := range posts {
+        result = append(result, h.enrichPostWithUserTag(&posts[i]))
+    }
+    return result
+}
 
 // ----- Management endpoints -----
 
@@ -201,7 +265,7 @@ func (h *PostHandler) Update(c *gin.Context) {
         // require perm EDIT_POST or superadmin
         if !mw.IsSuper(c) {
             var cnt int64
-            h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id=? AND permission=?", uid, "EDIT_POST").Scan(&cnt)
+            h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id=? AND permission=? AND deleted_at IS NULL", uid, "EDIT_POST").Scan(&cnt)
             if cnt == 0 { basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "no permission"); return }
         }
         canEdit = true
@@ -211,7 +275,7 @@ func (h *PostHandler) Update(c *gin.Context) {
             // need EDIT_POST if beyond window
             if !mw.IsSuper(c) {
                 var cnt int64
-                h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id=? AND permission=?", uid, "EDIT_POST").Scan(&cnt)
+                h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id=? AND permission=? AND deleted_at IS NULL", uid, "EDIT_POST").Scan(&cnt)
                 if cnt == 0 { basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "edit window closed"); return }
             }
         }
@@ -236,10 +300,11 @@ func (h *PostHandler) Delete(c *gin.Context) {
     if uid != p.AuthorID {
         if !mw.IsSuper(c) {
             var cnt int64
-            h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id=? AND permission=?", uid, "DELETE_POST").Scan(&cnt)
+            h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id=? AND permission=? AND deleted_at IS NULL", uid, "DELETE_POST").Scan(&cnt)
             if cnt == 0 { basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "no permission"); return }
         }
     }
+    // Mark as deleted using status=2 (as per specification)
     if err := h.db.Model(&model.Post{}).Where("id = ?", id).Update("status", 2).Error; err != nil { basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed"); return }
     basichttp.OK(c, gin.H{"id": id, "status": 2})
 }
