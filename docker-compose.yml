@@ -1,0 +1,21 @@
+version: "3.9"
+services:
+  love-wall:
+    build: .
+    image: lovewall:latest
+    container_name: love-wall
+    ports:
+      - "8124:8000"
+    environment:
+      - DB_DRIVER=sqlite
+      - DB_DSN=/app/data/app.db
+      - JWT_SECRET=please_change_me
+      - UPLOAD_DIR=/app/data/uploads
+      - UPLOAD_BASE_URL=/uploads
+      - RATE_LIMIT_RPS=20
+      - RATE_LIMIT_BURST=40
+      - ADMIN_INIT_USER=admin
+      - ADMIN_INIT_PASS=admin123
+    volumes:
+      - ./data:/app/data
+
