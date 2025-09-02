@@ -5,7 +5,6 @@ import (
     "time"
 
     "github.com/gin-gonic/gin"
-    "github.com/google/uuid"
     "gorm.io/gorm"
 
     "lovewall/internal/config"
@@ -107,7 +106,6 @@ func (h *CommentHandler) Create(c *gin.Context) {
     }
     uid, _ := c.Get(mw.CtxUserID)
     cm := &model.Comment{
-        BaseModel: model.BaseModel{ID: uuid.NewString()},
         PostID:    postID,
         UserID:    uid.(string),
         Content:   body.Content,

@@ -3,6 +3,8 @@ package db
 import (
     "errors"
     "fmt"
+    "os"
+    "path/filepath"
 
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
@@ -19,6 +21,13 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
     if cfg.DBDsn == "" {
         return nil, fmt.Errorf("DB_DSN required")
     }
+    
+    // Create directory for database file if it doesn't exist
+    dbDir := filepath.Dir(cfg.DBDsn)
+    if err := os.MkdirAll(dbDir, 0755); err != nil {
+        return nil, fmt.Errorf("failed to create database directory %s: %w", dbDir, err)
+    }
+    
     db, err := gorm.Open(sqlite.Open(cfg.DBDsn), &gorm.Config{
         Logger: logger.Default.LogMode(logger.Warn),
     })

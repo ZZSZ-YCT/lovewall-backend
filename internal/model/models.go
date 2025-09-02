@@ -2,6 +2,9 @@ package model
 
 import (
     "time"
+    
+    "gorm.io/gorm"
+    "lovewall/internal/utils"
 )
 
 type BaseModel struct {
@@ -9,6 +12,33 @@ type BaseModel struct {
     CreatedAt time.Time  `json:"created_at"`
     UpdatedAt time.Time  `json:"updated_at"`
     DeletedAt *time.Time `gorm:"index" json:"deleted_at,omitempty"`
+}
+
+// BeforeCreate hook to generate UUID for all models with duplicate checking
+func (base *BaseModel) BeforeCreate(tx *gorm.DB) error {
+    if base.ID == "" {
+        // Get table name from the statement
+        tableName := tx.Statement.Table
+        if tableName == "" {
+            // Fallback to schema table name
+            tableName = tx.Statement.Schema.Table
+        }
+        
+        // Generate unique ID with database verification
+        uniqueID, err := utils.GenerateUniqueID(tx, tableName, "id")
+        if err != nil {
+            return err
+        }
+        base.ID = uniqueID
+    } else {
+        // Validate provided ID
+        normalized, err := utils.NormalizeUUID(base.ID)
+        if err != nil {
+            return err
+        }
+        base.ID = normalized
+    }
+    return nil
 }
 
 type User struct {

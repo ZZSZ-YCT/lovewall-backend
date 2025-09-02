@@ -5,7 +5,6 @@ import (
     "time"
 
     "github.com/gin-gonic/gin"
-    "github.com/google/uuid"
     "gorm.io/gorm"
 
     "lovewall/internal/config"
@@ -41,7 +40,7 @@ type upsertBody struct {
 func (h *AnnouncementHandler) Create(c *gin.Context) {
     var b upsertBody
     if err := c.ShouldBindJSON(&b); err != nil { basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid body"); return }
-    a := &model.Announcement{BaseModel: model.BaseModel{ID: uuid.NewString()}, Title: b.Title, Content: b.Content}
+    a := &model.Announcement{Title: b.Title, Content: b.Content}
     if b.IsActive != nil { a.IsActive = *b.IsActive }
     a.Metadata = b.Metadata
     if err := h.db.Create(a).Error; err != nil { basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "create failed"); return }
