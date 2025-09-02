@@ -4,6 +4,7 @@ import (
     "crypto/rand"
     "encoding/hex"
     "os"
+    "path/filepath"
     "strconv"
 )
 
