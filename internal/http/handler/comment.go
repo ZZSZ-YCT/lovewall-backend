@@ -216,42 +216,6 @@ func (h *CommentHandler) ListMine(c *gin.Context) {
     basichttp.OK(c, gin.H{"total": total, "items": h.enrichCommentsWithUserTags(items), "page": page, "page_size": size})
 }
 
-// enrichCommentWithUserTag adds user tag information to comment response
-func (h *CommentHandler) enrichCommentWithUserTag(comment *model.Comment) gin.H {
-    result := gin.H{
-        "id":          comment.ID,
-        "post_id":     comment.PostID,
-        "user_id":     comment.UserID,
-        "content":     comment.Content,
-        "status":      comment.Status,
-        "metadata":    comment.Metadata,
-        "created_at":  comment.CreatedAt,
-        "updated_at":  comment.UpdatedAt,
-        "user_tag":    nil,
-    }
-    
-    // Get user's active tag
-    if tag, err := h.tagService.GetActiveUserTag(comment.UserID); err == nil && tag != nil {
-        result["user_tag"] = gin.H{
-            "name":             tag.Name,
-            "title":            tag.Title,
-            "background_color": tag.BackgroundColor,
-            "text_color":       tag.TextColor,
-        }
-    }
-    
-    return result
-}
-
-// enrichCommentsWithUserTags adds user tag information to multiple comments
-func (h *CommentHandler) enrichCommentsWithUserTags(comments []model.Comment) []gin.H {
-    result := make([]gin.H, 0, len(comments))
-    for i := range comments {
-        result = append(result, h.enrichCommentWithUserTag(&comments[i]))
-    }
-    return result
-}
-
 // GET /api/comments (MANAGE_COMMENTS) moderation list
 // query: post_id, user_id, status (0/1), page, page_size
 func (h *CommentHandler) ListModeration(c *gin.Context) {
@@ -270,40 +234,4 @@ func (h *CommentHandler) ListModeration(c *gin.Context) {
         return
     }
     basichttp.OK(c, gin.H{"total": total, "items": h.enrichCommentsWithUserTags(items), "page": page, "page_size": size})
-}
-
-// enrichCommentWithUserTag adds user tag information to comment response
-func (h *CommentHandler) enrichCommentWithUserTag(comment *model.Comment) gin.H {
-    result := gin.H{
-        "id":          comment.ID,
-        "post_id":     comment.PostID,
-        "user_id":     comment.UserID,
-        "content":     comment.Content,
-        "status":      comment.Status,
-        "metadata":    comment.Metadata,
-        "created_at":  comment.CreatedAt,
-        "updated_at":  comment.UpdatedAt,
-        "user_tag":    nil,
-    }
-    
-    // Get user's active tag
-    if tag, err := h.tagService.GetActiveUserTag(comment.UserID); err == nil && tag != nil {
-        result["user_tag"] = gin.H{
-            "name":             tag.Name,
-            "title":            tag.Title,
-            "background_color": tag.BackgroundColor,
-            "text_color":       tag.TextColor,
-        }
-    }
-    
-    return result
-}
-
-// enrichCommentsWithUserTags adds user tag information to multiple comments
-func (h *CommentHandler) enrichCommentsWithUserTags(comments []model.Comment) []gin.H {
-    result := make([]gin.H, 0, len(comments))
-    for i := range comments {
-        result = append(result, h.enrichCommentWithUserTag(&comments[i]))
-    }
-    return result
 }
