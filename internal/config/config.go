@@ -70,7 +70,7 @@ func Load() *Config {
     // Create upload directory if it doesn't exist
     if uploadDir != "" {
         if err := os.MkdirAll(uploadDir, 0755); err != nil {
-            panic("failed to create upload directory: " + err.Error())
+            panic("failed to create upload directory " + uploadDir + ": " + err.Error())
         }
     }
     

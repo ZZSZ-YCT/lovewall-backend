@@ -7,11 +7,13 @@ import (
 
     "github.com/gin-gonic/gin"
     "go.uber.org/zap"
+    "golang.org/x/crypto/bcrypt"
 
     "lovewall/internal/config"
     "lovewall/internal/db"
     "lovewall/internal/http/handler"
     mw "lovewall/internal/http/middleware"
+    "lovewall/internal/model"
 )
 
 func main() {
@@ -28,6 +30,31 @@ func main() {
 
     if err := db.AutoMigrate(database); err != nil {
         zap.L().Fatal("failed to run automigrate", zap.Error(err))
+    }
+
+    // Auto-create admin user if configured and no users exist
+    if cfg.AdminInitUser != "" && cfg.AdminInitPass != "" {
+        var userCount int64
+        database.Model(&model.User{}).Count(&userCount)
+        if userCount == 0 {
+            hashedPassword, err := bcrypt.GenerateFromPassword([]byte(cfg.AdminInitPass), bcrypt.DefaultCost)
+            if err != nil {
+                zap.L().Fatal("failed to hash admin password", zap.Error(err))
+            }
+            
+            adminUser := &model.User{
+                Username:     cfg.AdminInitUser,
+                PasswordHash: string(hashedPassword),
+                IsSuperadmin: true,
+                Status:       0,
+            }
+            
+            if err := database.Create(adminUser).Error; err != nil {
+                zap.L().Fatal("failed to create admin user", zap.Error(err))
+            }
+            
+            zap.L().Info("Admin user created successfully", zap.String("username", cfg.AdminInitUser))
+        }
     }
 
     r := gin.New()

@@ -13,9 +13,11 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o /out/server ./cmd/server
 # Runtime
 FROM alpine:3.20
 WORKDIR /app
-RUN adduser -D -H app && mkdir -p /app/data/uploads && chown -R app:app /app
+RUN adduser -D -H app
 COPY --from=builder /out/server /app/server
+RUN chown app:app /app/server
 USER app
+RUN mkdir -p /app/data/uploads
 ENV PORT=8000
 EXPOSE 8000
 ENTRYPOINT ["/app/server"]
