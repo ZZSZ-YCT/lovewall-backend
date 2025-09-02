@@ -13,11 +13,26 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o /out/server ./cmd/server
 # Runtime
 FROM alpine:3.20
 WORKDIR /app
-RUN adduser -D -H app
+
+# 固定 UID/GID，便于外部一致化
+RUN addgroup -g 10001 app && adduser -D -H -u 10001 -G app app
+
+# 用 su-exec（类似 gosu）来降权
+RUN apk add --no-cache su-exec
+
 COPY --from=builder /out/server /app/server
-RUN chown app:app /app/server
-USER app
-RUN mkdir -p /app/data/uploads
+
+# 启动脚本：保证目录存在并修好属主后再降权运行
+RUN printf '%s\n' \
+  '#!/bin/sh' \
+  'set -e' \
+  'mkdir -p /app/data/uploads' \
+  'chown -R app:app /app/data || true' \
+  'exec su-exec app:app /app/server' > /usr/local/bin/entrypoint.sh \
+  && chmod +x /usr/local/bin/entrypoint.sh
+
 ENV PORT=8000
 EXPOSE 8000
-ENTRYPOINT ["/app/server"]
+# 注意：保持 root 执行入口脚本（脚本里会降权）
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
