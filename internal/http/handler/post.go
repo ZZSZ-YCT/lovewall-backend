@@ -85,7 +85,6 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
     }
 
     p := &model.Post{
-        BaseModel:  model.BaseModel{ID: uuid.NewString()},
         AuthorID:   uid.(string),
         AuthorName: form.AuthorName,
         TargetName: form.TargetName,

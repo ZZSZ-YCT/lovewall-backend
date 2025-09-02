@@ -1,4 +1,3 @@
-version: "3.9"
 services:
   love-wall:
     build: .
@@ -18,4 +17,5 @@ services:
       - ADMIN_INIT_PASS=admin123
     volumes:
       - ./data:/app/data
+    restart: unless-stopped
 

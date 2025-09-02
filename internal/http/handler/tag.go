@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 
 	"lovewall/internal/config"
@@ -50,7 +49,6 @@ func (h *TagHandler) CreateTag(c *gin.Context) {
 	}
 
 	tag := &model.Tag{
-		BaseModel:       model.BaseModel{ID: uuid.NewString()},
 		Name:            req.Name,
 		Title:           req.Title,
 		BackgroundColor: req.BackgroundColor,
@@ -224,7 +222,6 @@ func (h *TagHandler) GenerateRedemptionCodes(c *gin.Context) {
 	
 	for _, code := range codes {
 		rc := model.RedemptionCode{
-			BaseModel: model.BaseModel{ID: uuid.NewString()},
 			Code:      code,
 			TagID:     req.TagID,
 			IsUsed:    false,
@@ -359,7 +356,6 @@ func (h *TagHandler) RedeemCode(c *gin.Context) {
 
 	// Give user the tag
 	userTag := model.UserTag{
-		BaseModel:  model.BaseModel{ID: uuid.NewString()},
 		UserID:     userID,
 		TagID:      code.TagID,
 		ObtainedAt: now,

@@ -6,7 +6,6 @@ import (
     "strings"
 
     "github.com/gin-gonic/gin"
-    "github.com/google/uuid"
     "gorm.io/gorm"
 
     "lovewall/internal/config"
@@ -57,7 +56,7 @@ func (h *AdminHandler) SetUserPermissions(c *gin.Context) {
     // Use Unscoped to permanently delete old permissions for this operation
     if err := tx.Unscoped().Where("user_id = ?", id).Delete(&model.UserPermission{}).Error; err != nil { tx.Rollback(); basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed"); return }
     for _, p := range perms {
-        up := model.UserPermission{BaseModel: model.BaseModel{ID: uuid.NewString()}, UserID: id, Permission: p}
+        up := model.UserPermission{UserID: id, Permission: p}
         if err := tx.Create(&up).Error; err != nil { tx.Rollback(); basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed"); return }
     }
     if err := tx.Commit().Error; err != nil { basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed"); return }

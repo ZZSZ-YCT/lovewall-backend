@@ -6,7 +6,6 @@ import (
     "time"
 
     "github.com/gin-gonic/gin"
-    "github.com/google/uuid"
     "golang.org/x/crypto/bcrypt"
     "gorm.io/gorm"
 
@@ -64,7 +63,6 @@ func (h *AuthHandler) Register(c *gin.Context) {
         }
     }
     u := &model.User{
-        BaseModel:    model.BaseModel{ID: uuid.NewString()},
         Username:     req.Username,
         PasswordHash: string(hashed),
         IsSuperadmin: isSuper,

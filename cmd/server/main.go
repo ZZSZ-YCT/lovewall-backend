@@ -16,9 +16,6 @@ import (
 
 func main() {
     cfg := config.Load()
-    if cfg.JWTSecret == "" {
-        zap.L().Fatal("JWT_SECRET is required; set env JWT_SECRET")
-    }
 
     logger, _ := zap.NewProduction()
     defer logger.Sync()

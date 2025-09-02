@@ -1,6 +1,8 @@
 package config
 
 import (
+    "crypto/rand"
+    "encoding/hex"
     "os"
     "strconv"
 )
@@ -48,16 +50,38 @@ func getint64(key string, def int64) int64 {
     return def
 }
 
+func generateJWTSecret() string {
+    bytes := make([]byte, 32)
+    if _, err := rand.Read(bytes); err != nil {
+        panic("failed to generate JWT secret: " + err.Error())
+    }
+    return hex.EncodeToString(bytes)
+}
+
 func Load() *Config {
+    jwtSecret := getenv("JWT_SECRET", "")
+    if jwtSecret == "" || jwtSecret == "please_change_me" {
+        jwtSecret = generateJWTSecret()
+    }
+    
+    uploadDir := getenv("UPLOAD_DIR", "./data/uploads")
+    
+    // Create upload directory if it doesn't exist
+    if uploadDir != "" {
+        if err := os.MkdirAll(uploadDir, 0755); err != nil {
+            panic("failed to create upload directory: " + err.Error())
+        }
+    }
+    
     return &Config{
         Port:           getinti("PORT", 8000),
         DBDriver:       getenv("DB_DRIVER", "sqlite"),
         DBDsn:          getenv("DB_DSN", "./data/app.db"),
-        JWTSecret:      getenv("JWT_SECRET", ""),
+        JWTSecret:      jwtSecret,
         JWTTTL:         getint64("JWT_TTL", 86400),
         RefreshTTL:     getint64("REFRESH_TTL", 2592000),
         CookieName:     getenv("COOKIE_NAME", "auth_token"),
-        UploadDir:      getenv("UPLOAD_DIR", "./data/uploads"),
+        UploadDir:      uploadDir,
         UploadBaseURL:  getenv("UPLOAD_BASE_URL", "/uploads"),
         MaxUploadMB:    getint64("MAX_UPLOAD_MB", 10),
         AdminInitUser:  getenv("ADMIN_INIT_USER", ""),
