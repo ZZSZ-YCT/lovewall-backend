@@ -3,8 +3,10 @@ package db
 import (
     "errors"
     "fmt"
+    "log"
     "os"
     "path/filepath"
+    "time"
 
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
@@ -28,8 +30,20 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
         return nil, fmt.Errorf("failed to create database directory %s: %w", dbDir, err)
     }
     
+    // Configure GORM logger to reduce noise and ignore `record not found` situations,
+    // which are expected in flows like fetching a user's active tag when none exists yet.
+    newLogger := logger.New(
+        log.New(os.Stdout, "", log.LstdFlags),
+        logger.Config{
+            SlowThreshold:             2 * time.Second,
+            LogLevel:                  logger.Warn,
+            IgnoreRecordNotFoundError: true,
+            Colorful:                  true,
+        },
+    )
+
     db, err := gorm.Open(sqlite.Open(cfg.DBDsn), &gorm.Config{
-        Logger: logger.Default.LogMode(logger.Warn),
+        Logger: newLogger,
     })
     if err != nil {
         return nil, err
@@ -50,4 +64,3 @@ func AutoMigrate(db *gorm.DB) error {
         &model.UserTag{},
     )
 }
-
