@@ -20,7 +20,6 @@ type Config struct {
     MaxUploadMB     int64
     AdminInitUser   string
     AdminInitPass   string
-    AllowOrigins    string
     RateLimitRPS    int
     RateLimitBurst  int
 }
@@ -86,7 +85,6 @@ func Load() *Config {
         MaxUploadMB:    getint64("MAX_UPLOAD_MB", 10),
         AdminInitUser:  getenv("ADMIN_INIT_USER", ""),
         AdminInitPass:  getenv("ADMIN_INIT_PASS", ""),
-        AllowOrigins:   getenv("ALLOW_ORIGINS", ""),
         RateLimitRPS:   getinti("RATE_LIMIT_RPS", 20),
         RateLimitBurst: getinti("RATE_LIMIT_BURST", 40),
     }

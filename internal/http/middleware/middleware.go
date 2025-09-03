@@ -103,26 +103,15 @@ func RequirePerm(db *gorm.DB, perm string) gin.HandlerFunc {
     }
 }
 
-func CORS(origins []string) gin.HandlerFunc {
-    allowed := map[string]struct{}{}
-    for _, o := range origins {
-        o = strings.TrimSpace(o)
-        if o != "" {
-            allowed[o] = struct{}{}
-        }
-    }
+func CORS() gin.HandlerFunc {
     return func(c *gin.Context) {
-        origin := c.GetHeader("Origin")
-        if origin != "" {
-            if len(allowed) == 0 {
-                c.Header("Access-Control-Allow-Origin", origin)
-            } else if _, ok := allowed[origin]; ok {
-                c.Header("Access-Control-Allow-Origin", origin)
-            }
-            c.Header("Access-Control-Allow-Credentials", "true")
-            c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-            c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-        }
+        // Always set CORS headers
+        c.Header("Access-Control-Allow-Origin", "*")
+        c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With, Accept, Origin")
+        c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD")
+        c.Header("Access-Control-Expose-Headers", "Content-Length, Content-Type")
+        c.Header("Access-Control-Max-Age", "86400")
+        
         if c.Request.Method == http.MethodOptions {
             c.AbortWithStatus(http.StatusNoContent)
             return

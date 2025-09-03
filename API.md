@@ -316,7 +316,6 @@ curl -X POST http://localhost:8000/api/announcements \
 
 ## 备注与限制
 
-- CORS: 服务按环境变量 `ALLOW_ORIGINS` 控制允许来源（逗号分隔）。
 - 上传: 仅允许 `image/jpeg`, `image/png`, `image/webp`, `image/gif`，大小由 `MAX_UPLOAD_MB` 限制。
 - 时间窗编辑: 作者创建 15 分钟内可直接编辑；超时需 `EDIT_POST` 或超管。
 - 软删除策略: 帖子通过 `status=2` 标记；公共列表默认过滤 `status!=0`。

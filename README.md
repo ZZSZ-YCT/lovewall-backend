@@ -10,7 +10,7 @@
 - 📢 **公告管理** - 系统公告的发布和管理
 - 🏷️ **标签系统** - 用户标签和兑换码系统
 - 👑 **权限管理** - 超级管理员和细粒度权限控制
-- 🔒 **安全防护** - 限流、CORS、安全头等
+- 🔒 **安全防护** - 限流、安全头等
 - 🐳 **容器化** - Docker 和 Docker Compose 部署支持
 
 ## 🚀 快速开始
@@ -112,7 +112,6 @@ docker-compose down
 | `MAX_UPLOAD_MB` | 最大上传文件大小(MB) | `10` |
 | `ADMIN_INIT_USER` | 初始管理员用户名 | `` |
 | `ADMIN_INIT_PASS` | 初始管理员密码 | `` |
-| `ALLOW_ORIGINS` | CORS 允许的源(逗号分隔) | `` |
 | `RATE_LIMIT_RPS` | 限流每秒请求数 | `20` |
 | `RATE_LIMIT_BURST` | 限流突发请求数 | `40` |
 

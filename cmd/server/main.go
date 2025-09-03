@@ -3,7 +3,6 @@ package main
 import (
     "fmt"
     "net/http"
-    "strings"
 
     "github.com/gin-gonic/gin"
     "go.uber.org/zap"
@@ -61,9 +60,7 @@ func main() {
     r.Use(gin.Recovery())
     r.Use(mw.RequestLogger())
     r.Use(mw.RateLimit(cfg.RateLimitRPS, cfg.RateLimitBurst))
-    if origins := cfg.AllowOrigins; origins != "" {
-        r.Use(mw.CORS(strings.Split(origins, ",")))
-    }
+    r.Use(mw.CORS())
     // Security headers (lightweight)
     r.Use(func(c *gin.Context) {
         c.Writer.Header().Set("X-Content-Type-Options", "nosniff")
