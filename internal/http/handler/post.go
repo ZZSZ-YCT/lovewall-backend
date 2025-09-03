@@ -307,3 +307,60 @@ func (h *PostHandler) Delete(c *gin.Context) {
     if err := h.db.Model(&model.Post{}).Where("id = ?", id).Update("status", 2).Error; err != nil { basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed"); return }
     basichttp.OK(c, gin.H{"id": id, "status": 2})
 }
+
+// ListModeration lists posts for admins, including hidden and deleted ones.
+// GET /api/posts/moderation (auth; requires any of HIDE_POST/DELETE_POST/EDIT_POST or superadmin)
+// query: status (0/1/2), author_id, featured=true, pinned=true, page, page_size
+func (h *PostHandler) ListModeration(c *gin.Context) {
+    // Permission check: allow superadmin or user having any of the post management permissions
+    if !mw.IsSuper(c) {
+        uid, _ := c.Get(mw.CtxUserID)
+        var cnt int64
+        h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission IN (?, ?, ?) AND deleted_at IS NULL",
+            uid, "HIDE_POST", "DELETE_POST", "EDIT_POST").Scan(&cnt)
+        if cnt == 0 { basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "no permission"); return }
+    }
+
+    page := queryInt(c, "page", 1)
+    size := queryInt(c, "page_size", 20)
+    if size > 100 { size = 100 }
+    dbq := h.db.Model(&model.Post{}).Where("deleted_at IS NULL")
+
+    if v := c.Query("status"); v != "" { dbq = dbq.Where("status = ?", v) }
+    if v := c.Query("author_id"); v != "" { dbq = dbq.Where("author_id = ?", v) }
+    if v := c.Query("featured"); v == "true" { dbq = dbq.Where("is_featured = 1") }
+    if v := c.Query("pinned"); v == "true" { dbq = dbq.Where("is_pinned = 1") }
+
+    var total int64
+    dbq.Count(&total)
+    var items []model.Post
+    if err := dbq.Order("created_at DESC").Offset((page-1)*size).Limit(size).Find(&items).Error; err != nil {
+        basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed"); return
+    }
+    basichttp.OK(c, gin.H{"total": total, "items": h.enrichPostsWithUserTags(items), "page": page, "page_size": size})
+}
+
+// Restore sets a deleted post (status=2) back to visible (status=0)
+// POST /api/posts/:id/restore (auth; requires DELETE_POST or superadmin)
+func (h *PostHandler) Restore(c *gin.Context) {
+    id := c.Param("id")
+    // Permission: DELETE_POST or superadmin
+    if !mw.IsSuper(c) {
+        uid, _ := c.Get(mw.CtxUserID)
+        var cnt int64
+        h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id=? AND permission=? AND deleted_at IS NULL", uid, "DELETE_POST").Scan(&cnt)
+        if cnt == 0 { basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "no permission"); return }
+    }
+
+    var p model.Post
+    if err := h.db.First(&p, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
+        basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found"); return
+    }
+    if p.Status != 2 {
+        basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "post is not deleted"); return
+    }
+    if err := h.db.Model(&model.Post{}).Where("id = ?", id).Update("status", 0).Error; err != nil {
+        basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "restore failed"); return
+    }
+    basichttp.OK(c, gin.H{"id": id, "status": 0})
+}

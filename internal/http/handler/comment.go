@@ -64,6 +64,7 @@ func (h *CommentHandler) enrichCommentWithUserTag(comment *model.Comment) gin.H 
         "created_at":  comment.CreatedAt,
         "updated_at":  comment.UpdatedAt,
         "user_tag":    nil,
+        "user_display_name": nil,
     }
     
     // Get user's active tag
@@ -73,6 +74,16 @@ func (h *CommentHandler) enrichCommentWithUserTag(comment *model.Comment) gin.H 
             "title":            tag.Title,
             "background_color": tag.BackgroundColor,
             "text_color":       tag.TextColor,
+        }
+    }
+
+    // Attach user's current display name (fallback to username if empty)
+    var user model.User
+    if err := h.db.Select("username, display_name").First(&user, "id = ? AND deleted_at IS NULL", comment.UserID).Error; err == nil {
+        if user.DisplayName != nil && *user.DisplayName != "" {
+            result["user_display_name"] = *user.DisplayName
+        } else {
+            result["user_display_name"] = user.Username
         }
     }
     
@@ -220,10 +231,14 @@ func (h *CommentHandler) ListModeration(c *gin.Context) {
     page := queryInt(c, "page", 1)
     size := queryInt(c, "page_size", 20)
     if size > 100 { size = 100 }
-    dbq := h.db.Model(&model.Comment{}).Where("deleted_at IS NULL")
-    if v := c.Query("post_id"); v != "" { dbq = dbq.Where("post_id = ?", v) }
-    if v := c.Query("user_id"); v != "" { dbq = dbq.Where("user_id = ?", v) }
-    if v := c.Query("status"); v != "" { dbq = dbq.Where("status = ?", v) }
+    // Exclude comments of posts that are soft-deleted (posts.status = 2),
+    // but allow comments for hidden posts (status = 1).
+    dbq := h.db.Model(&model.Comment{}).
+        Joins("JOIN posts ON posts.id = comments.post_id AND posts.deleted_at IS NULL").
+        Where("comments.deleted_at IS NULL AND (posts.status IS NULL OR posts.status <> 2)")
+    if v := c.Query("post_id"); v != "" { dbq = dbq.Where("comments.post_id = ?", v) }
+    if v := c.Query("user_id"); v != "" { dbq = dbq.Where("comments.user_id = ?", v) }
+    if v := c.Query("status"); v != "" { dbq = dbq.Where("comments.status = ?", v) }
     var total int64
     dbq.Count(&total)
     var items []model.Comment

@@ -100,6 +100,9 @@ func main() {
     authed.POST("/posts/:id/pin", mw.RequirePerm(database, "PIN_POST"), postH.Pin)
     authed.POST("/posts/:id/feature", mw.RequirePerm(database, "FEATURE_POST"), postH.Feature)
     authed.POST("/posts/:id/hide", mw.RequirePerm(database, "HIDE_POST"), postH.Hide)
+    // Posts moderation list and restore (internal permission checks inside handlers for OR semantics)
+    authed.GET("/posts/moderation", postH.ListModeration)
+    authed.POST("/posts/:id/restore", postH.Restore)
 
     authed.POST("/announcements", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.Create)
     authed.PUT("/announcements/:id", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.Update)
