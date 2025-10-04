@@ -61,7 +61,12 @@ func (h *TagHandler) CreateTag(c *gin.Context) {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "create failed")
 		return
 	}
-
+	// Log operation
+	if uid, ok := c.Get(mw.CtxUserID); ok {
+		if uidStr, ok2 := uid.(string); ok2 {
+			service.LogOperation(h.db, uidStr, "create_tag", "tag", tag.ID, map[string]any{"name": tag.Name})
+		}
+	}
 	basichttp.JSON(c, http.StatusCreated, tag)
 }
 
@@ -86,7 +91,7 @@ func (h *TagHandler) ListTags(c *gin.Context) {
 	}
 
 	q.Count(&total)
-	if err := q.Order("created_at DESC").Offset((page-1)*size).Limit(size).Find(&items).Error; err != nil {
+	if err := q.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
 		return
 	}
@@ -160,6 +165,11 @@ func (h *TagHandler) UpdateTag(c *gin.Context) {
 
 	// Reload updated tag
 	h.db.First(&tag, "id = ?", id)
+	if uid, ok := c.Get(mw.CtxUserID); ok {
+		if uidStr, ok2 := uid.(string); ok2 {
+			service.LogOperation(h.db, uidStr, "update_tag", "tag", id, nil)
+		}
+	}
 	basichttp.OK(c, tag)
 }
 
@@ -170,14 +180,46 @@ func (h *TagHandler) DeleteTag(c *gin.Context) {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "tag not found")
 		return
 	}
-
-	// Soft delete
-	now := time.Now()
-	if err := h.db.Model(&model.Tag{}).Where("id = ?", id).Update("deleted_at", now).Error; err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+	// Cascade delete related records in a transaction
+	tx := h.db.Begin()
+	// 1) Find all users who have this tag
+	var userIDs []string
+	if err := tx.Model(&model.UserTag{}).
+		Where("tag_id = ? AND deleted_at IS NULL", id).
+		Pluck("user_id", &userIDs).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
 		return
 	}
-
+	// 2) Delete ALL tags of those users (as per requirement)
+	if len(userIDs) > 0 {
+		if err := tx.Unscoped().Where("user_id IN ?", userIDs).Delete(&model.UserTag{}).Error; err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete user tags failed")
+			return
+		}
+	}
+	// 3) Delete all redemption codes (used or not) belonging to this tag
+	if err := tx.Unscoped().Where("tag_id = ?", id).Delete(&model.RedemptionCode{}).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete codes failed")
+		return
+	}
+	// 4) Hard delete the tag itself
+	if err := tx.Unscoped().Delete(&tag).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete tag failed")
+		return
+	}
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+		return
+	}
+	if uid, ok := c.Get(mw.CtxUserID); ok {
+		if uidStr, ok2 := uid.(string); ok2 {
+			service.LogOperation(h.db, uidStr, "delete_tag", "tag", id, nil)
+		}
+	}
 	basichttp.OK(c, gin.H{"id": id, "deleted": true})
 }
 
@@ -219,7 +261,7 @@ func (h *TagHandler) GenerateRedemptionCodes(c *gin.Context) {
 	// Save codes to database in transaction
 	tx := h.db.Begin()
 	redemptionCodes := make([]model.RedemptionCode, 0, len(codes))
-	
+
 	for _, code := range codes {
 		rc := model.RedemptionCode{
 			Code:      code,
@@ -228,7 +270,7 @@ func (h *TagHandler) GenerateRedemptionCodes(c *gin.Context) {
 			ExpiresAt: req.ExpiresAt,
 			BatchID:   &batchID,
 		}
-		
+
 		if err := tx.Create(&rc).Error; err != nil {
 			tx.Rollback()
 			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to save codes")
@@ -241,7 +283,11 @@ func (h *TagHandler) GenerateRedemptionCodes(c *gin.Context) {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
 		return
 	}
-
+	if uid, ok := c.Get(mw.CtxUserID); ok {
+		if uidStr, ok2 := uid.(string); ok2 {
+			service.LogOperation(h.db, uidStr, "generate_redemption_codes", "tag", tag.ID, map[string]any{"count": len(codes)})
+		}
+	}
 	basichttp.JSON(c, http.StatusCreated, gin.H{
 		"batch_id": batchID,
 		"tag":      tag,
@@ -265,6 +311,9 @@ func (h *TagHandler) ListRedemptionCodes(c *gin.Context) {
 	if tagID := c.Query("tag_id"); tagID != "" {
 		q = q.Where("tag_id = ?", tagID)
 	}
+	if code := c.Query("code"); code != "" {
+		q = q.Where("code = ?", code)
+	}
 	if batchID := c.Query("batch_id"); batchID != "" {
 		q = q.Where("batch_id = ?", batchID)
 	}
@@ -277,7 +326,7 @@ func (h *TagHandler) ListRedemptionCodes(c *gin.Context) {
 	}
 
 	q.Count(&total)
-	if err := q.Order("created_at DESC").Offset((page-1)*size).Limit(size).Find(&items).Error; err != nil {
+	if err := q.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
 		return
 	}
@@ -288,6 +337,111 @@ func (h *TagHandler) ListRedemptionCodes(c *gin.Context) {
 		"page":      page,
 		"page_size": size,
 	})
+}
+
+// GET /api/redemption-codes/by-code/:code (auth; MANAGE_TAGS)
+// Returns detailed information for a redemption code, including whether it's used and by whom.
+func (h *TagHandler) GetRedemptionCodeByCode(c *gin.Context) {
+	codeStr := c.Param("code")
+	var rc model.RedemptionCode
+	if err := h.db.Preload("Tag").Preload("User").First(&rc, "code = ? AND deleted_at IS NULL", codeStr).Error; err != nil {
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "code not found")
+		return
+	}
+	basichttp.OK(c, rc)
+}
+
+// POST /api/admin/users/:id/tags/:tag_id (auth; MANAGE_TAGS)
+// Assign specified tag to user. If body {"active": true}, set it as active and deactivate others.
+func (h *TagHandler) AssignUserTagToUser(c *gin.Context) {
+	userID := c.Param("id")
+	tagID := c.Param("tag_id")
+	var body struct {
+		Active bool `json:"active"`
+	}
+	_ = c.ShouldBindJSON(&body)
+
+	// Ensure tag exists and active state doesn't block assignment
+	var tag model.Tag
+	if err := h.db.First(&tag, "id = ? AND deleted_at IS NULL", tagID).Error; err != nil {
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "tag not found")
+		return
+	}
+
+	// Check if user already has this tag
+	var existing model.UserTag
+	err := h.db.First(&existing, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, tagID).Error
+	if err == nil {
+		// Already has tag; optionally update active flag
+		if body.Active {
+			// Deactivate others and activate this one
+			if err := h.db.Model(&model.UserTag{}).Where("user_id = ? AND deleted_at IS NULL", userID).Update("is_active", false).Error; err != nil {
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
+				return
+			}
+			if err := h.db.Model(&existing).Update("is_active", true).Error; err != nil {
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
+				return
+			}
+		}
+		h.db.Preload("Tag").First(&existing, "id = ?", existing.ID)
+		if uid, ok := c.Get(mw.CtxUserID); ok {
+			if uidStr, ok2 := uid.(string); ok2 {
+				service.LogOperation(h.db, uidStr, "assign_user_tag", "user", userID, map[string]any{"tag_id": tagID, "active": body.Active})
+			}
+		}
+		basichttp.OK(c, existing)
+		return
+	}
+
+	now := time.Now()
+	ut := model.UserTag{
+		UserID:     userID,
+		TagID:      tagID,
+		ObtainedAt: now,
+		IsActive:   false,
+	}
+	if body.Active {
+		// Deactivate others and mark this active
+		if err := h.db.Model(&model.UserTag{}).Where("user_id = ? AND deleted_at IS NULL", userID).Update("is_active", false).Error; err != nil {
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
+			return
+		}
+		ut.IsActive = true
+	}
+	if err := h.db.Create(&ut).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "create failed")
+		return
+	}
+	h.db.Preload("Tag").First(&ut, "id = ?", ut.ID)
+	if uid, ok := c.Get(mw.CtxUserID); ok {
+		if uidStr, ok2 := uid.(string); ok2 {
+			service.LogOperation(h.db, uidStr, "assign_user_tag", "user", userID, map[string]any{"tag_id": tagID, "active": body.Active})
+		}
+	}
+	basichttp.JSON(c, http.StatusCreated, ut)
+}
+
+// DELETE /api/admin/users/:id/tags/:tag_id (auth; MANAGE_TAGS)
+// Remove specified tag from user (soft delete).
+func (h *TagHandler) RemoveUserTagFromUser(c *gin.Context) {
+	userID := c.Param("id")
+	tagID := c.Param("tag_id")
+	var ut model.UserTag
+	if err := h.db.First(&ut, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, tagID).Error; err != nil {
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user tag not found")
+		return
+	}
+	if err := h.db.Unscoped().Delete(&ut).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+		return
+	}
+	if uid, ok := c.Get(mw.CtxUserID); ok {
+		if uidStr, ok2 := uid.(string); ok2 {
+			service.LogOperation(h.db, uidStr, "remove_user_tag", "user", userID, map[string]any{"tag_id": tagID})
+		}
+	}
+	basichttp.OK(c, gin.H{"ok": true})
 }
 
 // User Redemption
@@ -342,6 +496,15 @@ func (h *TagHandler) RedeemCode(c *gin.Context) {
 	// Transaction to redeem code
 	tx := h.db.Begin()
 
+	// Deactivate all existing user tags to ensure only one active tag
+	if err := tx.Model(&model.UserTag{}).
+		Where("user_id = ? AND deleted_at IS NULL", userID).
+		Update("is_active", false).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "redeem failed")
+		return
+	}
+
 	// Mark code as used
 	now := time.Now()
 	if err := tx.Model(&code).Updates(map[string]interface{}{
@@ -388,13 +551,52 @@ func (h *TagHandler) RedeemCode(c *gin.Context) {
 func (h *TagHandler) ListUserTags(c *gin.Context) {
 	uid, _ := c.Get(mw.CtxUserID)
 	userID := uid.(string)
+	// If query all=true, return all tags with status mapping
+	if c.Query("all") == "true" {
+		svc := service.NewUserTagService(h.db)
+		userTags, err := svc.GetUserTags(userID)
+		if err != nil {
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+			return
+		}
+		items := make([]gin.H, 0, len(userTags))
+		for i := range userTags {
+			ut := userTags[i]
+			status := "inactive"
+			if ut.Tag.IsActive {
+				if ut.IsActive {
+					status = "active"
+				} else {
+					status = "inactive"
+				}
+			} else {
+				status = "tag_disabled"
+			}
+			items = append(items, gin.H{
+				"user_tag_id": ut.ID,
+				"tag": gin.H{
+					"id":               ut.Tag.ID,
+					"name":             ut.Tag.Name,
+					"title":            ut.Tag.Title,
+					"background_color": ut.Tag.BackgroundColor,
+					"text_color":       ut.Tag.TextColor,
+					"is_active":        ut.Tag.IsActive,
+				},
+				"obtained_at": ut.ObtainedAt,
+				"is_active":   ut.IsActive,
+				"status":      status,
+			})
+		}
+		basichttp.OK(c, gin.H{"total": len(items), "items": items})
+		return
+	}
 
+	// Default: keep backward-compatible behavior (only active ones)
 	var userTags []model.UserTag
 	if err := h.db.Preload("Tag").Where("user_id = ? AND deleted_at IS NULL AND is_active = ?", userID, true).Find(&userTags).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
 		return
 	}
-
 	basichttp.OK(c, userTags)
 }
 
@@ -423,4 +625,169 @@ func (h *TagHandler) SetActiveTag(c *gin.Context) {
 		"message": "Active tag updated successfully",
 		"tag":     userTag.Tag,
 	})
+}
+
+// AdminListUserTags returns all tags owned by the specified user (admin only via router perm).
+// GET /api/admin/users/:id/tags (auth; MANAGE_TAGS)
+func (h *TagHandler) AdminListUserTags(c *gin.Context) {
+	userID := c.Param("id")
+	svc := service.NewUserTagService(h.db)
+	userTags, err := svc.GetUserTags(userID)
+	if err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+		return
+	}
+	items := make([]gin.H, 0, len(userTags))
+	for i := range userTags {
+		ut := userTags[i]
+		status := "inactive"
+		if ut.Tag.IsActive {
+			if ut.IsActive {
+				status = "active"
+			} else {
+				status = "inactive"
+			}
+		} else {
+			status = "tag_disabled"
+		}
+		items = append(items, gin.H{
+			"user_tag_id": ut.ID,
+			"tag": gin.H{
+				"id":               ut.Tag.ID,
+				"name":             ut.Tag.Name,
+				"title":            ut.Tag.Title,
+				"background_color": ut.Tag.BackgroundColor,
+				"text_color":       ut.Tag.TextColor,
+				"is_active":        ut.Tag.IsActive,
+			},
+			"obtained_at": ut.ObtainedAt,
+			"is_active":   ut.IsActive,
+			"status":      status,
+		})
+	}
+	basichttp.OK(c, gin.H{"total": len(items), "items": items})
+}
+
+// GET /api/my/tags/current-status (auth)
+// Returns whether current active tag exists and whether it is enabled (tag.is_active)
+func (h *TagHandler) MyCurrentTagStatus(c *gin.Context) {
+	uid, _ := c.Get(mw.CtxUserID)
+	userID := uid.(string)
+	var ut model.UserTag
+	if err := h.db.Preload("Tag").First(&ut, "user_id = ? AND is_active = 1 AND deleted_at IS NULL", userID).Error; err != nil {
+		basichttp.OK(c, gin.H{"has_active": false})
+		return
+	}
+	status := "inactive"
+	enabled := false
+	if ut.Tag.IsActive {
+		status = "active"
+		enabled = true
+	} else {
+		status = "tag_disabled"
+	}
+	basichttp.OK(c, gin.H{
+		"has_active":          true,
+		"current_tag_enabled": enabled,
+		"tag": gin.H{
+			"id":        ut.Tag.ID,
+			"name":      ut.Tag.Name,
+			"title":     ut.Tag.Title,
+			"is_active": ut.Tag.IsActive,
+		},
+		"status": status,
+	})
+}
+
+// GET /api/my/tags/:tag_id/status (auth)
+// Returns whether the specified owned tag is currently enabled (tag.is_active). 404 if user does not own.
+func (h *TagHandler) MyTagStatusByTagID(c *gin.Context) {
+	tagID := c.Param("tag_id")
+	uid, _ := c.Get(mw.CtxUserID)
+	userID := uid.(string)
+	var ut model.UserTag
+	if err := h.db.Preload("Tag").First(&ut, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, tagID).Error; err != nil {
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "tag not owned by user")
+		return
+	}
+	enabled := ut.Tag.IsActive
+	status := "inactive"
+	if enabled {
+		status = "active"
+	} else {
+		status = "tag_disabled"
+	}
+	basichttp.OK(c, gin.H{
+		"tag": gin.H{
+			"id":        ut.Tag.ID,
+			"name":      ut.Tag.Name,
+			"title":     ut.Tag.Title,
+			"is_active": ut.Tag.IsActive,
+		},
+		"enabled": enabled,
+		"status":  status,
+	})
+}
+
+// DELETE /api/redemption-codes (auth; MANAGE_TAGS)
+// Body: { "ids": ["id1","id2"], "codes": ["CODE-...", ...] }
+// Deletes only unused codes. Used codes are skipped and reported.
+func (h *TagHandler) DeleteRedemptionCodes(c *gin.Context) {
+	var body struct {
+		IDs   []string `json:"ids"`
+		Codes []string `json:"codes"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || (len(body.IDs) == 0 && len(body.Codes) == 0) {
+		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "provide ids or codes")
+		return
+	}
+	// Fetch matching codes
+	dbq := h.db.Model(&model.RedemptionCode{}).Where("deleted_at IS NULL")
+	if len(body.IDs) > 0 && len(body.Codes) > 0 {
+		dbq = dbq.Where("id IN ? OR code IN ?", body.IDs, body.Codes)
+	} else if len(body.IDs) > 0 {
+		dbq = dbq.Where("id IN ?", body.IDs)
+	} else {
+		dbq = dbq.Where("code IN ?", body.Codes)
+	}
+	var list []model.RedemptionCode
+	if err := dbq.Find(&list).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+		return
+	}
+	deletableIDs := make([]string, 0)
+	skipped := make([]gin.H, 0)
+	foundIDs := make(map[string]struct{})
+	for _, rc := range list {
+		foundIDs[rc.ID] = struct{}{}
+		if rc.IsUsed {
+			skipped = append(skipped, gin.H{"id": rc.ID, "code": rc.Code, "reason": "already used"})
+			continue
+		}
+		deletableIDs = append(deletableIDs, rc.ID)
+	}
+	// Identify requested but not found
+	if len(body.IDs) > 0 {
+		for _, id := range body.IDs {
+			if _, ok := foundIDs[id]; !ok {
+				skipped = append(skipped, gin.H{"id": id, "reason": "not found"})
+			}
+		}
+	}
+	// Perform delete
+	deleted := int64(0)
+	if len(deletableIDs) > 0 {
+		if err := h.db.Unscoped().Where("id IN ?", deletableIDs).Delete(&model.RedemptionCode{}).Error; err != nil {
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+			return
+		}
+		deleted = int64(len(deletableIDs))
+	}
+	// Log operation
+	if uid, ok := c.Get(mw.CtxUserID); ok {
+		if uidStr, ok2 := uid.(string); ok2 {
+			service.LogOperation(h.db, uidStr, "delete_redemption_codes", "redemption_code", "", map[string]any{"deleted": deleted, "skipped": len(skipped)})
+		}
+	}
+	basichttp.OK(c, gin.H{"deleted": deleted, "skipped": skipped})
 }

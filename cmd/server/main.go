@@ -1,139 +1,207 @@
 package main
 
 import (
-    "fmt"
-    "net/http"
+	"fmt"
+	"net/http"
 
-    "github.com/gin-gonic/gin"
-    "go.uber.org/zap"
-    "golang.org/x/crypto/bcrypt"
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+	"golang.org/x/crypto/bcrypt"
+	"time"
 
-    "lovewall/internal/config"
-    "lovewall/internal/db"
-    "lovewall/internal/http/handler"
-    mw "lovewall/internal/http/middleware"
-    "lovewall/internal/model"
+	"lovewall/internal/config"
+	"lovewall/internal/db"
+	"lovewall/internal/http/handler"
+	mw "lovewall/internal/http/middleware"
+	"lovewall/internal/model"
+	"lovewall/internal/service"
 )
 
 func main() {
-    cfg := config.Load()
+	cfg := config.Load()
 
-    logger, _ := zap.NewProduction()
-    defer logger.Sync()
-    zap.ReplaceGlobals(logger)
+	logger, _ := zap.NewProduction()
+	defer logger.Sync()
+	zap.ReplaceGlobals(logger)
 
-    database, err := db.Open(cfg)
-    if err != nil {
-        zap.L().Fatal("failed to open database", zap.Error(err))
-    }
+	database, err := db.Open(cfg)
+	if err != nil {
+		zap.L().Fatal("failed to open database", zap.Error(err))
+	}
 
-    if err := db.AutoMigrate(database); err != nil {
-        zap.L().Fatal("failed to run automigrate", zap.Error(err))
-    }
+	if err := db.AutoMigrate(database); err != nil {
+		zap.L().Fatal("failed to run automigrate", zap.Error(err))
+	}
 
-    // Auto-create admin user if configured and no users exist
-    if cfg.AdminInitUser != "" && cfg.AdminInitPass != "" {
-        var userCount int64
-        database.Model(&model.User{}).Count(&userCount)
-        if userCount == 0 {
-            hashedPassword, err := bcrypt.GenerateFromPassword([]byte(cfg.AdminInitPass), bcrypt.DefaultCost)
-            if err != nil {
-                zap.L().Fatal("failed to hash admin password", zap.Error(err))
-            }
-            
-            adminUser := &model.User{
-                Username:     cfg.AdminInitUser,
-                PasswordHash: string(hashedPassword),
-                IsSuperadmin: true,
-                Status:       0,
-            }
-            
-            if err := database.Create(adminUser).Error; err != nil {
-                zap.L().Fatal("failed to create admin user", zap.Error(err))
-            }
-            
-            zap.L().Info("Admin user created successfully", zap.String("username", cfg.AdminInitUser))
-        }
-    }
+	// Configure AI request limiter from env
+	service.InitAILimiter(cfg.AIRateRPS, cfg.AIRateBurst)
 
-    r := gin.New()
-    r.Use(gin.Recovery())
-    r.Use(mw.RequestLogger())
-    r.Use(mw.RateLimit(cfg.RateLimitRPS, cfg.RateLimitBurst))
-    r.Use(mw.CORS())
-    // Security headers (lightweight)
-    r.Use(func(c *gin.Context) {
-        c.Writer.Header().Set("X-Content-Type-Options", "nosniff")
-        c.Writer.Header().Set("X-Frame-Options", "DENY")
-        c.Next()
-    })
+	// Cleanup orphaned tag relations to avoid frontend showing ghost "标签"
+	service.CleanupOrphanedTagRelations(database)
 
-    // Serve uploads statically if configured
-    if cfg.UploadDir != "" && cfg.UploadBaseURL != "" {
-        r.Static(cfg.UploadBaseURL, cfg.UploadDir)
-    }
+	// Start moderation worker (async AI review)
+	service.StartModerationWorker(database, service.NewConfigAdapter(cfg.AIBaseURL, cfg.AIAPIKey, cfg.AIModel))
 
-    api := r.Group("/api")
+	// Start async writer for request logs to reduce SQLite write contention
+	mw.StartRequestLogWriter(database)
 
-    authH := handler.NewAuthHandler(database, cfg)
-    postH := handler.NewPostHandler(database, cfg)
-    annH := handler.NewAnnouncementHandler(database, cfg)
-    cmtH := handler.NewCommentHandler(database, cfg)
-    adminH := handler.NewAdminHandler(database, cfg)
-    tagH := handler.NewTagHandler(database, cfg)
+	// Auto-create admin user if configured and no users exist
+	if cfg.AdminInitUser != "" && cfg.AdminInitPass != "" {
+		var userCount int64
+		database.Model(&model.User{}).Count(&userCount)
+		if userCount == 0 {
+			hashedPassword, err := bcrypt.GenerateFromPassword([]byte(cfg.AdminInitPass), bcrypt.DefaultCost)
+			if err != nil {
+				zap.L().Fatal("failed to hash admin password", zap.Error(err))
+			}
 
-    api.POST("/register", authH.Register)
-    api.POST("/login", authH.Login)
-    api.POST("/logout", authH.Logout)
-    api.GET("/posts", postH.ListPosts)
-    api.GET("/posts/:id", postH.GetPost)
-    api.GET("/posts/:id/comments", cmtH.ListForPost)
-    api.GET("/announcements", annH.List)
-    api.GET("/tags", tagH.ListTags)
+			adminUser := &model.User{
+				Username:     cfg.AdminInitUser,
+				PasswordHash: string(hashedPassword),
+				IsSuperadmin: true,
+				Status:       0,
+			}
 
-    authed := api.Group("")
-    authed.Use(mw.RequireAuth(cfg.JWTSecret))
-    authed.GET("/profile", authH.Profile)
-    authed.POST("/posts", postH.CreatePost)
-    authed.PUT("/posts/:id", postH.Update)
-    authed.DELETE("/posts/:id", postH.Delete)
-    authed.POST("/posts/:id/pin", mw.RequirePerm(database, "PIN_POST"), postH.Pin)
-    authed.POST("/posts/:id/feature", mw.RequirePerm(database, "FEATURE_POST"), postH.Feature)
-    authed.POST("/posts/:id/hide", mw.RequirePerm(database, "HIDE_POST"), postH.Hide)
-    // Posts moderation list and restore (internal permission checks inside handlers for OR semantics)
-    authed.GET("/posts/moderation", postH.ListModeration)
-    authed.POST("/posts/:id/restore", postH.Restore)
+			if err := database.Create(adminUser).Error; err != nil {
+				zap.L().Fatal("failed to create admin user", zap.Error(err))
+			}
 
-    authed.POST("/announcements", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.Create)
-    authed.PUT("/announcements/:id", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.Update)
-    authed.DELETE("/announcements/:id", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.Delete)
+			zap.L().Info("Admin user created successfully", zap.String("username", cfg.AdminInitUser))
+		}
+	}
 
-    authed.GET("/users", mw.RequirePerm(database, "MANAGE_USERS"), adminH.ListUsers)
-    authed.PUT("/users/:id", authH.UpdateUser)
-    authed.POST("/users/:id/permissions", adminH.SetUserPermissions)
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(mw.RequestLogger())
+	r.Use(mw.RequestDBLogger(database))
+	r.Use(mw.RateLimit(cfg.RateLimitRPS, cfg.RateLimitBurst))
+	r.Use(mw.CORS())
+	// Security headers (lightweight)
+	r.Use(func(c *gin.Context) {
+		c.Writer.Header().Set("X-Content-Type-Options", "nosniff")
+		c.Writer.Header().Set("X-Frame-Options", "DENY")
+		c.Next()
+	})
 
-    authed.POST("/posts/:id/comments", cmtH.Create)
-    authed.DELETE("/comments/:id", cmtH.Delete)
-    authed.PUT("/comments/:id", cmtH.Update)
-    authed.POST("/comments/:id/hide", mw.RequirePerm(database, "MANAGE_COMMENTS"), cmtH.Hide)
-    authed.GET("/my/comments", cmtH.ListMine)
-    authed.GET("/comments", mw.RequirePerm(database, "MANAGE_COMMENTS"), cmtH.ListModeration)
+	// Serve uploads statically if configured
+	if cfg.UploadDir != "" && cfg.UploadBaseURL != "" {
+		r.Static(cfg.UploadBaseURL, cfg.UploadDir)
+	}
 
-    // Tag and Redemption Code APIs
-    authed.POST("/tags", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.CreateTag)
-    authed.PUT("/tags/:id", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.UpdateTag)
-    authed.DELETE("/tags/:id", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.DeleteTag)
-    authed.GET("/tags/:id", tagH.GetTag)
-    
-    authed.POST("/tags/generate-codes", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.GenerateRedemptionCodes)
-    authed.GET("/redemption-codes", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.ListRedemptionCodes)
-    
-    authed.POST("/redeem", tagH.RedeemCode)
-    authed.GET("/my/tags", tagH.ListUserTags)
-    authed.POST("/my/tags/:tag_id/activate", tagH.SetActiveTag)
+	api := r.Group("/api")
 
-    addr := fmt.Sprintf(":%d", cfg.Port)
-    if err := http.ListenAndServe(addr, r); err != nil {
-        zap.L().Fatal("server error", zap.Error(err))
-    }
+	authH := handler.NewAuthHandler(database, cfg)
+	postH := handler.NewPostHandler(database, cfg)
+	annH := handler.NewAnnouncementHandler(database, cfg)
+	cmtH := handler.NewCommentHandler(database, cfg)
+	adminH := handler.NewAdminHandler(database, cfg)
+	tagH := handler.NewTagHandler(database, cfg)
+	logH := handler.NewLogHandler(database, cfg)
+	notifyH := handler.NewNotifyHandler(database, cfg)
+
+	api.POST("/register", authH.Register)
+	api.POST("/login", authH.Login)
+	api.POST("/logout", authH.Logout)
+	// Public user lookup for avatar/nickname
+	api.GET("/users/:id", authH.GetUserPublicByID)
+	api.GET("/users/by-username/:username", authH.GetUserPublicByUsername)
+	api.GET("/users/:id/status", authH.GetUserStatusByID)
+	api.GET("/users/by-username/:username/status", authH.GetUserStatusByUsername)
+	// Public: fetch user's active tag by ID/username
+	api.GET("/users/:id/active-tag", authH.GetUserActiveTagByID)
+	api.GET("/users/by-username/:username/active-tag", authH.GetUserActiveTagByUsername)
+	api.GET("/posts", postH.ListPosts)
+	api.GET("/posts/:id", postH.GetPost)
+	api.GET("/users/:id/posts", postH.ListByUser)
+	api.GET("/posts/:id/stats", postH.Stats)
+	api.GET("/posts/:id/comments", cmtH.ListForPost)
+	api.GET("/announcements", annH.List)
+	api.GET("/tags", tagH.ListTags)
+
+	authed := api.Group("")
+	authed.Use(mw.RequireAuth(cfg.JWTSecret))
+	authed.Use(mw.ValidateSessionAndUser(database))
+	authed.GET("/profile", authH.Profile)
+	authed.PATCH("/profile", authH.UpdateProfile)
+	authed.PUT("/me/password", authH.ChangeMyPassword)
+	authed.GET("/users/me/online", authH.OnlineStatus)
+	// Note: Logout is already exposed at /api/logout (public).
+	// The handler supports token extraction and blacklist, so a second
+	// registration here would duplicate the same route and cause a panic.
+	// Therefore, we omit an authenticated duplicate route.
+	// Behavior rate-limit (per device/fingerprint/browser) and quotas from env
+	authed.POST(
+		"/posts",
+		mw.LimitAction("post_create", cfg.ActionPostCount, time.Duration(cfg.ActionPostWindowSec)*time.Second),
+		mw.EnforcePostDailyQuota(database, cfg.QuotaPostsPerUserPerDay, cfg.QuotaPostsPerIPPerDay),
+		postH.CreatePost,
+	)
+	authed.POST("/posts/:id/request-review", postH.RequestManualReview)
+	// Edit post endpoint removed per requirement (no editing)
+	authed.DELETE("/posts/:id", postH.Delete)
+	authed.POST("/posts/:id/pin", mw.RequirePerm(database, "MANAGE_FEATURED"), postH.Pin)
+	authed.POST("/posts/:id/feature", mw.RequirePerm(database, "MANAGE_FEATURED"), postH.Feature)
+	authed.POST("/posts/:id/hide", mw.RequirePerm(database, "MANAGE_POSTS"), postH.Hide)
+	// Posts moderation list (internal permission checks inside handlers for OR semantics)
+	authed.GET("/posts/moderation", postH.ListModeration)
+
+	authed.POST("/announcements", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.Create)
+	authed.PUT("/announcements/:id", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.Update)
+	authed.DELETE("/announcements/:id", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.Delete)
+	authed.POST("/admin/posts/:id/approve", adminH.ApprovePost)
+	authed.POST("/admin/posts/:id/reject", adminH.RejectPost)
+
+	authed.GET("/users", mw.RequirePerm(database, "MANAGE_USERS"), adminH.ListUsers)
+	authed.PUT("/users/:id", authH.UpdateUser)
+	authed.POST("/users/:id/permissions", adminH.SetUserPermissions)
+	authed.PUT("/admin/users/:id/password", adminH.UpdateUserPassword)
+	authed.POST("/admin/users/:id/ban", adminH.BanUser)
+	authed.POST("/admin/users/:id/unban", adminH.UnbanUser)
+	authed.DELETE("/admin/users/:id", adminH.DeleteUser)
+	authed.GET("/admin/metrics/overview", adminH.MetricsOverview)
+
+	// Behavior rate-limit and quotas from env
+	authed.POST(
+		"/posts/:id/comments",
+		mw.LimitAction("comment_create", cfg.ActionCommentCount, time.Duration(cfg.ActionCommentWindowSec)*time.Second),
+		mw.EnforceCommentHourlyQuota(database, cfg.QuotaCommentsPerUserPerHour, cfg.QuotaCommentsPerIPPerHour),
+		cmtH.Create,
+	)
+	authed.DELETE("/comments/:id", cmtH.Delete)
+	// Edit comment endpoint removed per requirement (no editing)
+	authed.POST("/comments/:id/hide", mw.RequirePerm(database, "MANAGE_COMMENTS"), cmtH.Hide)
+	authed.GET("/my/comments", cmtH.ListMine)
+	authed.GET("/comments", mw.RequirePerm(database, "MANAGE_COMMENTS"), cmtH.ListModeration)
+
+	// Tag and Redemption Code APIs
+	authed.POST("/tags", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.CreateTag)
+	authed.PUT("/tags/:id", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.UpdateTag)
+	authed.DELETE("/tags/:id", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.DeleteTag)
+	authed.GET("/tags/:id", tagH.GetTag)
+
+	authed.POST("/tags/generate-codes", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.GenerateRedemptionCodes)
+	authed.GET("/redemption-codes", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.ListRedemptionCodes)
+	authed.GET("/redemption-codes/by-code/:code", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.GetRedemptionCodeByCode)
+	authed.DELETE("/redemption-codes", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.DeleteRedemptionCodes)
+
+	authed.POST("/redeem", tagH.RedeemCode)
+	// Admin user tag management
+	authed.POST("/admin/users/:id/tags/:tag_id", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.AssignUserTagToUser)
+	authed.DELETE("/admin/users/:id/tags/:tag_id", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.RemoveUserTagFromUser)
+	authed.GET("/admin/users/:id/tags", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.AdminListUserTags)
+	// Admin logs (superadmin only; enforced inside handlers)
+	authed.GET("/admin/logs/submissions", logH.ListSubmissionLogs)
+	authed.GET("/admin/logs/operations", logH.ListOperationLogs)
+	authed.GET("/my/tags", tagH.ListUserTags)
+	authed.GET("/my/tags/current-status", tagH.MyCurrentTagStatus)
+	authed.GET("/my/tags/:tag_id/status", tagH.MyTagStatusByTagID)
+	authed.POST("/my/tags/:tag_id/activate", tagH.SetActiveTag)
+	// Notifications
+	authed.GET("/notifications", notifyH.List)
+	authed.POST("/notifications/:id/read", notifyH.MarkRead)
+
+	addr := fmt.Sprintf(":%d", cfg.Port)
+	if err := http.ListenAndServe(addr, r); err != nil {
+		zap.L().Fatal("server error", zap.Error(err))
+	}
 }

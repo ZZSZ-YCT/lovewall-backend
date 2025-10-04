@@ -2,3 +2,8 @@ CLAUDE.md
 .claude
 .idea
 data
+.env
+.env
+.env.*
+!.env.example
+条目审核提示词.txt

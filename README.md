@@ -144,11 +144,8 @@ lovewall-backend/
 - **超级管理员** (`is_superadmin=true`): 拥有所有权限
 - **权限点**:
   - `MANAGE_USERS` - 用户管理
-  - `EDIT_POST` - 编辑帖子
-  - `DELETE_POST` - 删除帖子
-  - `HIDE_POST` - 隐藏/显示帖子
-  - `PIN_POST` - 置顶帖子
-  - `FEATURE_POST` - 精选帖子
+  - `MANAGE_POSTS` - 帖子审核/隐藏/删除
+  - `MANAGE_FEATURED` - 置顶/精选帖子
   - `MANAGE_ANNOUNCEMENTS` - 公告管理
   - `MANAGE_COMMENTS` - 评论管理
   - `MANAGE_TAGS` - 标签和兑换码管理

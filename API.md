@@ -109,18 +109,124 @@
   "success": true,
   "data": {
     "user": { "id": "...", "username": "demo", "is_superadmin": false, "created_at": "...", "updated_at": "..." },
-    "permissions": ["PIN_POST", "FEATURE_POST"]
+    "permissions": ["MANAGE_POSTS", "MANAGE_FEATURED"]
   },
   "trace_id": "..."
 }
 ```
+
+### 更新个人资料
+- 方法: `PATCH`
+- 路径: `/api/profile`
+- 认证: 是
+- Content-Type: `application/json`
+- Body（任意字段可选）:
+```json
+{
+  "display_name": "新的显示名称",
+  "email": "user@example.com",
+  "phone": "13800138000",
+  "bio": "这是我的个人简介",
+  "avatar_base64": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQ..."
+}
+```
+- 头像: 支持 `jpeg/png/webp/gif`，解码后 ≤ 5MB；存储至 `${UPLOAD_DIR}/avatars/{用户ID}-{毫秒时间戳}.{ext}`，访问路径 `${UPLOAD_BASE_URL}/avatars/...`。仅保留当前头像，更新成功后会删除旧头像文件。
+- 验证: `display_name`≤100，`bio`≤500，`email` 邮箱格式（唯一），`phone` `^1[3-9]\d{9}$`（唯一）。
+
+### 公共用户信息查询（用于头像/昵称展示）
+- 方法: `GET`
+- 路径: `/api/users/{id}`
+- 认证: 否
+- 响应: 用户的公开信息（不包含邮箱/手机号等敏感字段）
+```json
+{
+  "success": true,
+  "data": {
+    "id": "user-uuid",
+    "username": "demo",
+    "display_name": "昵称或null",
+    "avatar_url": "/uploads/avatars/user-uuid-....jpg",
+    "status": 0,
+    "created_at": "...",
+    "updated_at": "..."
+  },
+  "trace_id": "..."
+}
+```
+
+- 方法: `GET`
+- 路径: `/api/users/by-username/{username}`
+- 认证: 否
+- 说明: 与按 `id` 查询同样的返回结构。
 
 ### 用户列表（管理员）
 - 方法: `GET`
 - 路径: `/api/users`
 - 认证: 是（`MANAGE_USERS`）
 - 查询参数: `q`（用户名/邮箱模糊），`status`，`page`，`page_size`
-- 响应: 分页结构，`items` 为用户精简信息。
+- 响应: 分页结构，`items` 为用户精简信息，并包含 `permissions` 数组。
+
+### 禁用/解禁用户（管理员）
+- 禁用用户
+  - 方法: `POST`
+  - 路径: `/api/admin/users/{id}/ban`
+  - 认证: 是（`MANAGE_USERS` 或超管）
+  - Body:
+  ```json
+  { "reason": "违反社区规则" }
+  ```
+  - 返回:
+  ```json
+  { "success": true, "data": { "id": "...", "is_banned": true, "ban_reason": "违反社区规则" }, "trace_id": "..." }
+  ```
+
+- 解禁用户
+  - 方法: `POST`
+  - 路径: `/api/admin/users/{id}/unban`
+  - 认证: 是（`MANAGE_USERS` 或超管）
+  - 返回:
+  ```json
+  { "success": true, "data": { "id": "...", "is_banned": false }, "trace_id": "..." }
+  ```
+
+### 被禁用户登录提示
+- 登录接口若用户被禁用，将返回错误：
+```json
+{
+  "success": false,
+  "error": { "code": "BANNED", "message": "违反社区规则" },
+  "banned": true,
+  "ban_reason": "违反社区规则",
+  "trace_id": "..."
+}
+```
+
+### 被禁用户主页展示
+- 公开用户信息接口 `GET /api/users/{id}` 与 `GET /api/users/by-username/{username}`：
+  - 若用户被禁用，仅返回：`id`, `username`, `is_banned: true`。
+  - 不再返回 `display_name`、`avatar_url`、`bio` 等详细资料。
+  - 标签使用原有接口获取：`GET /api/users/{id}/active-tag` 或按用户名版本。
+
+### 更新用户（管理员）
+- 方法: `PUT`
+- 路径: `/api/users/{id}`
+- 认证: 是（自己可更新部分字段；修改他人需 `MANAGE_USERS`。更改 `username` 仅限具备 `MANAGE_USERS` 或超管。）
+- Content-Type: `application/json`
+- Body（字段可选）:
+```json
+{
+  "username": "newname",           // 仅管理员可改，3-32 字符且唯一
+  "display_name": "昵称",
+  "email": "user@example.com",
+  "phone": "13800138000",
+  "bio": "简介...",
+  "avatar_base64": "data:image/png;base64,iVBORw0K...", // 可选；保存后覆盖 avatar_url
+  "avatar_url": "/uploads/avatars/xxx.png",              // 可选；直接设置 URL
+  "password": "NewSecurePass1!",                         // 自己改密码需提供 old_password
+  "old_password": "OldPass"                               // 仅当 self 修改密码时必填
+}
+```
+- 响应: 成功返回更新后的用户对象（新增字段 `permissions` 仅在列表接口返回）。
 
 ### 设置用户权限（仅超管）
 - 方法: `POST`
@@ -128,7 +234,7 @@
 - 认证: 是（仅超级管理员）
 - Body:
 ```json
-{ "permissions": ["PIN_POST", "FEATURE_POST", "HIDE_POST", "DELETE_POST", "EDIT_POST", "MANAGE_USERS", "MANAGE_ANNOUNCEMENTS"] }
+{ "permissions": ["MANAGE_FEATURED", "MANAGE_POSTS", "MANAGE_USERS", "MANAGE_ANNOUNCEMENTS"] }
 ```
 - 说明: 覆盖式写入，原有权限将被清空后重建。
 
@@ -167,7 +273,8 @@
 - 认证: 是
 - Content-Type: `multipart/form-data`
 - 表单字段:
-  - `author_name` `string` 必填
+  - `confessor_mode` `string` 可选，取值：`self` 或 `custom`（默认 `custom`）。
+  - `author_name` `string` 当 `confessor_mode=custom` 时必填；`confessor_mode=self` 时可省略（后端将使用当前用户的显示名/用户名）。
   - `target_name` `string` 必填
   - `content` `string` 必填
   - `image` `file` 可选（MIME: jpeg/png/webp/gif；大小<=`MAX_UPLOAD_MB`）
@@ -183,18 +290,18 @@
 { "author_name": "匿名A", "target_name": "小王", "content": "更新内容" }
 ```
 - 规则:
-  - 作者在创建后 15 分钟内可编辑；超时需要 `EDIT_POST` 或超管。
+  - 作者在创建后 15 分钟内可编辑；超时需要 `MANAGE_POSTS` 或超管。
 
-### 删除（软删）
+### 删除（硬删）
 - 方法: `DELETE`
 - 路径: `/api/posts/{id}`
 - 认证: 是
-- 规则: 作者或具备 `DELETE_POST` 的用户可执行；将 `status` 置为 2。
+- 规则: 作者或具备 `MANAGE_POSTS` 的用户可执行；直接物理删除该帖子及其评论（仅保留操作日志），不可恢复。
 
 ### 置顶（管理员）
 - 方法: `POST`
 - 路径: `/api/posts/{id}/pin`
-- 认证: 是（`PIN_POST`）
+- 认证: 是（`MANAGE_FEATURED`）
 - Body:
 ```json
 { "pin": true }
@@ -207,7 +314,7 @@
 ### 精选（管理员）
 - 方法: `POST`
 - 路径: `/api/posts/{id}/feature`
-- 认证: 是（`FEATURE_POST`）
+- 认证: 是（`MANAGE_FEATURED`）
 - Body:
 ```json
 { "feature": true }
@@ -216,7 +323,7 @@
 ### 隐藏（管理员）
 - 方法: `POST`
 - 路径: `/api/posts/{id}/hide`
-- 认证: 是（`HIDE_POST`）
+- 认证: 是（`MANAGE_POSTS`）
 - Body:
 ```json
 { "hide": true }
@@ -261,7 +368,7 @@
 - 方法: `DELETE`
 - 路径: `/api/announcements/{id}`
 - 认证: 是（`MANAGE_ANNOUNCEMENTS`）
-- 说明: 当前实现为“停用”（`is_active=false`），保留记录。
+- 说明: 直接删除（硬删除）。
 
 ## 认证与权限
 
@@ -270,11 +377,8 @@
 - 超级管理员：`is_superadmin=true`，默认拥有全部权限，且可通过接口覆盖普通用户权限。
 - 权限点（建议）：
   - `MANAGE_USERS` 用户管理
-  - `EDIT_POST` 编辑帖子（超时编辑）
-  - `DELETE_POST` 删除帖子
-  - `HIDE_POST` 隐藏/恢复帖子
-  - `PIN_POST` 置顶帖子
-  - `FEATURE_POST` 精选帖子
+  - `MANAGE_POSTS` 帖子审核/隐藏/删除
+  - `MANAGE_FEATURED` 置顶/精选帖子
   - `MANAGE_ANNOUNCEMENTS` 公告管理
   - `MANAGE_COMMENTS` 评论管理
   - `MANAGE_TAGS` 标签和兑换码管理
@@ -317,8 +421,8 @@ curl -X POST http://localhost:8000/api/announcements \
 ## 备注与限制
 
 - 上传: 仅允许 `image/jpeg`, `image/png`, `image/webp`, `image/gif`，大小由 `MAX_UPLOAD_MB` 限制。
-- 时间窗编辑: 作者创建 15 分钟内可直接编辑；超时需 `EDIT_POST` 或超管。
-- 软删除策略: 帖子通过 `status=2` 标记；公共列表默认过滤 `status!=0`。
+- 时间窗编辑: 作者创建 15 分钟内可直接编辑；超时需 `MANAGE_POSTS` 或超管。
+- 帖子删除策略: 通过 `status=2` 标记（不做物理删除）；公共列表默认过滤 `status!=0`。
 - 稳定性: 返回携带 `trace_id`，便于日志排查。
 
 ## 预留与 Roadmap（未实现）
@@ -341,6 +445,7 @@ curl -X POST http://localhost:8000/api/announcements \
 - 路径: `/api/posts/{id}/comments`
 - 查询: `page`, `page_size`
 - 规则: 仅当父帖子 `status=0` 时可见；仅返回 `status=0` 的评论。
+- 响应项附带：`user_display_name`（昵称，若无则为 `username` 回退）、`user_username`（用户名），以及 `user_id`，便于前端按需查询用户头像。
 
 ### 创建（需认证）
 - 方法: `POST`
@@ -375,7 +480,7 @@ curl -X POST http://localhost:8000/api/announcements \
 ```json
 { "hide": true }
 ```
-- 说明: `hide=true` → `status=1`，`false` → `status=0`。
+- 说明: `hide=true` → `status=1`，`false` → `status=0`。删除为硬删除，无法恢复。
 
 ### 我的评论（需认证）
 - 方法: `GET`
@@ -466,7 +571,7 @@ curl -X POST http://localhost:8000/api/announcements \
 - 方法: `DELETE`
 - 路径: `/api/tags/{id}`
 - 认证: 是（`MANAGE_TAGS`）
-- 说明: 软删除，设置 `deleted_at`
+- 说明: 直接删除（硬删除）
 
 ### 生成兑换码（管理员）
 - 方法: `POST`
@@ -507,7 +612,85 @@ curl -X POST http://localhost:8000/api/announcements \
 - 方法: `GET`
 - 路径: `/api/redemption-codes`
 - 认证: 是（`MANAGE_TAGS`）
-- 查询参数: `tag_id`, `batch_id`, `used`=`true|false`, `page`, `page_size`
+- 查询参数: `tag_id`, `code`, `batch_id`, `used`=`true|false`, `page`, `page_size`
+- 返回: 分页结构，`items` 包含 `tag` 与 `user`（使用者）。
+
+### 删除兑换码（管理员）
+- 方法: `DELETE`
+- 路径: `/api/redemption-codes`
+- 认证: 是（`MANAGE_TAGS`）
+- Body:
+```json
+{ "ids": ["id1","id2"], "codes": ["ABCD-..."] }
+```
+- 说明: 仅删除未使用的兑换码；已使用的会跳过并返回原因；支持批量。
+- 返回示例:
+```json
+{ "success": true, "data": { "deleted": 3, "skipped": [{"id":"...","code":"...","reason":"already used"}] }, "trace_id": "..." }
+```
+
+### 兑换码详情（管理员）
+- 方法: `GET`
+- 路径: `/api/redemption-codes/by-code/{code}`
+- 认证: 是（`MANAGE_TAGS`）
+- 说明: 返回是否已使用、使用者、关联标签、过期时间等。
+
+### 管理员分配/删除用户标签
+- 分配标签给用户
+  - 方法: `POST`
+  - 路径: `/api/admin/users/{user_id}/tags/{tag_id}`
+  - 认证: 是（`MANAGE_TAGS`）
+  - Body（可选）:
+  ```json
+  { "active": true }
+  ```
+  - 说明: 若 `active=true`，将该标签设为当前活跃标签（会取消该用户其它标签的活跃状态）。若用户已拥有该标签，仅更新活跃状态。
+
+- 删除用户的指定标签
+  - 方法: `DELETE`
+  - 路径: `/api/admin/users/{user_id}/tags/{tag_id}`
+  - 认证: 是（`MANAGE_TAGS`）
+  - 说明: 直接删除该用户标签记录（硬删除）。
+
+- 查询用户拥有的标签
+  - 方法: `GET`
+  - 路径: `/api/admin/users/{user_id}/tags`
+  - 认证: 是（`MANAGE_TAGS`）
+  - 返回: 与 `GET /api/my/tags?all=true` 相同结构，包含每个标签的 `user_tag_id/tag/obtained_at/is_active/status`。
+
+### 平台指标（管理员）
+- 方法: `GET`
+- 路径: `/api/admin/metrics/overview`
+- 认证: 是（`MANAGE_USERS` 或超管）
+- 返回示例:
+```json
+{
+  "total_comments": 12345,
+  "today_comments": 67,
+  "today_new_users": 10,
+  "since": "2025-09-06T00:00:00+08:00"
+}
+```
+
+## 日志（Logs）
+
+- 日志分类：请求日志（不提供 API 查询）、提交日志（记录用户发布帖子与创建评论）、操作日志（记录管理员操作）。所有日志均持久化到数据库。
+
+### 提交日志列表（仅超管）
+- 方法: `GET`
+- 路径: `/api/admin/logs/submissions`
+- 认证: 是（仅超级管理员）
+- 查询参数（可选）: `user_id`, `action`, `object_type`, `object_id`, `from`(RFC3339), `to`(RFC3339), `page`, `page_size`
+- 返回: 分页结构，`items` 为提交日志记录。
+
+### 操作日志列表（仅超管）
+- 方法: `GET`
+- 路径: `/api/admin/logs/operations`
+- 认证: 是（仅超级管理员）
+- 查询参数（可选）: `admin_id`, `action`, `object_type`, `object_id`, `from`(RFC3339), `to`(RFC3339), `page`, `page_size`
+- 返回: 分页结构，`items` 为操作日志记录。
+
+说明：请求日志（每次 HTTP 请求）已持久化，但不对外提供 API 查询。
 
 ### 兑换码（用户）
 - 方法: `POST`
@@ -519,6 +702,9 @@ curl -X POST http://localhost:8000/api/announcements \
   "code": "ABCD-EFGH-IJKL-MNOP-QRST-UVWX-YZ"
 }
 ```
+- 行为说明:
+  - 成功兑换后，系统会自动将新获得的标签设为活跃（active），并在同一事务内将该用户其它标签的活跃状态全部取消，保证任意时刻只有一个活跃标签。
+  - 仍可通过手动激活接口 `POST /api/my/tags/{tag_id}/activate` 切换活跃标签。
 - 成功响应:
 ```json
 {
@@ -543,11 +729,52 @@ curl -X POST http://localhost:8000/api/announcements \
 }
 ```
 
+### 用户活跃标签（公开）
+- 方法: `GET`
+- 路径:
+  - 按ID: `/api/users/{id}/active-tag`
+  - 按用户名: `/api/users/by-username/{username}/active-tag`
+- 认证: 否（公开）
+- 成功响应示例:
+```json
+{
+  "success": true,
+  "data": {
+    "name": "vip",
+    "title": "VIP用户",
+    "background_color": "#FFD700",
+    "text_color": "#000000",
+    "user_deleted": false
+  }
+}
+```
+- 响应新增 `user_deleted` 字段：用户处于软删除状态时返回 `true`，前端可在展示层提示“账号已注销/不可访问”。
+- 无活跃标签或用户不存在: 返回 `404 NOT_FOUND`
+
 ### 我的标签列表
 - 方法: `GET`
 - 路径: `/api/my/tags`
 - 认证: 是
 - 说明: 获取当前用户拥有的所有标签
+
+### 我的当前标签状态
+- 方法: `GET`
+- 路径: `/api/my/tags/current-status`
+- 认证: 是
+- 返回示例:
+```json
+{ "success": true, "data": { "has_active": true, "current_tag_enabled": true, "tag": {"id":"...","name":"vip","title":"VIP用户","is_active":true}, "status":"active" }, "trace_id": "..." }
+```
+
+### 我的指定标签状态
+- 方法: `GET`
+- 路径: `/api/my/tags/{tag_id}/status`
+- 认证: 是
+- 说明: 仅限查询自己拥有的标签；未拥有返回 404。
+- 返回示例:
+```json
+{ "success": true, "data": { "enabled": false, "status": "tag_disabled", "tag": {"id":"...","name":"...","title":"...","is_active":false} }, "trace_id": "..." }
+```
 
 ### 设置活跃标签
 - 方法: `POST`
@@ -612,3 +839,49 @@ curl -X POST http://localhost:8000/api/announcements \
   }
 }
 ```
+
+## 系统通知（HTML 内容）
+
+- `GET /api/notifications` 返回的 `items[].content` 现为 HTML 片段，封装在统一的 `.notification-card` 容器内；前端需要以安全方式渲染（建议白名单渲染或在受信任容器中使用 `innerHTML`）。
+- 所有文本字段（帖子内容、原因、操作者姓名等）均已在服务端进行 HTML 转义，默认样式示例：
+
+```html
+<div class="notification-card">
+  <h3>帖子被隐藏</h3>
+  <p><strong>处理人：</strong>管理员昵称</p>
+  <p><strong>帖子 ID：</strong>post-uuid</p>
+  <p><strong>表白对象：</strong>张三</p>
+  <p><strong>发布者：</strong>李四</p>
+  <p><strong>处理原因：</strong>AI 检测到敏感词，请修改后重新发布。</p>
+  <div class="post-preview">
+    <div class="post-preview__label">原始内容</div>
+    <pre class="post-preview__body" style="white-space: pre-wrap;">……原帖正文……</pre>
+  </div>
+  <div class="notification-actions">
+    <button class="notification-action-placeholder" data-role="replace-action">等待替换按钮</button>
+  </div>
+</div>
+```
+
+- 占位按钮 `.notification-action-placeholder` 供前端在渲染阶段替换为实际 CTA；可通过 `data-role="replace-action"` 精确定位。
+- 人工复核通知额外包含占位链接 `{{acceptLink}}`、`{{rejectLink}}`，分别用于“通过复核”“驳回请求”的按钮 href。
+
+### 新增“理由”字段
+
+以下接口的请求体新增可选字段 `reason`，用于在通知中回显处理原因（旧请求体仍兼容）：
+
+```json
+// 置顶 / 取消置顶
+POST /api/posts/{id}/pin
+{ "pin": true, "reason": "高优质内容" }
+
+// 加精 / 取消加精
+POST /api/posts/{id}/feature
+{ "feature": false, "reason": "活动已结束" }
+
+// 隐藏 / 取消隐藏
+POST /api/posts/{id}/hide
+{ "hide": true, "reason": "含有待整改内容" }
+```
+
+未传入时后端会提供默认说明；`reason` 将同步出现在通知卡片中，便于用户了解处理背景。
