@@ -31,6 +31,16 @@ func (h *AnnouncementHandler) List(c *gin.Context) {
 	basichttp.OK(c, items)
 }
 
+// AdminList returns all announcements (including stopped ones) for admin use
+func (h *AnnouncementHandler) AdminList(c *gin.Context) {
+	var items []model.Announcement
+	if err := h.db.Where("deleted_at IS NULL").Order("created_at DESC").Find(&items).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+		return
+	}
+	basichttp.OK(c, items)
+}
+
 type upsertBody struct {
 	Title    string  `json:"title" binding:"required"`
 	Content  string  `json:"content" binding:"required"`

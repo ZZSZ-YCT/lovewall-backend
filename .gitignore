@@ -7,3 +7,6 @@ data
 .env.*
 !.env.example
 条目审核提示词.txt
+*.md
+*.MD
+!README.md

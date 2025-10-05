@@ -36,15 +36,29 @@ func NewPostHandler(db *gorm.DB, cfg *config.Config) *PostHandler {
 
 type CreatePostForm struct {
 	AuthorName    string `form:"author_name" json:"author_name"`
-	TargetName    string `form:"target_name" binding:"required" json:"target_name"`
+	TargetName    string `form:"target_name" json:"target_name"`
 	Content       string `form:"content" binding:"required" json:"content"`
 	ConfessorMode string `form:"confessor_mode" json:"confessor_mode"` // optional: "self" or "custom"
+	CardType      string `form:"card_type" json:"card_type"`
 }
 
 func (h *PostHandler) CreatePost(c *gin.Context) {
 	var form CreatePostForm
 	if err := c.ShouldBind(&form); err != nil {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid form")
+		return
+	}
+	cardType := strings.ToLower(strings.TrimSpace(form.CardType))
+	if cardType == "" {
+		cardType = "confession"
+	}
+	if cardType != "confession" && cardType != "social" {
+		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid card_type")
+		return
+	}
+	targetName := strings.TrimSpace(form.TargetName)
+	if cardType == "confession" && targetName == "" {
+		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "target_name is required for confession cards")
 		return
 	}
 	uid, _ := c.Get(mw.CtxUserID)
@@ -148,7 +162,7 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "author_name过长")
 		return
 	}
-	if len([]rune(form.TargetName)) > 200 {
+	if len([]rune(targetName)) > 200 {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "target_name过长")
 		return
 	}
@@ -156,12 +170,13 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 	p := &model.Post{
 		AuthorID:      uid.(string),
 		AuthorName:    authorName,
-		TargetName:    form.TargetName,
+		TargetName:    targetName,
 		Content:       form.Content,
 		Status:        1, // hidden while awaiting AI moderation
 		IsPinned:      false,
 		IsFeatured:    false,
 		ConfessorMode: &mode,
+		CardType:      &cardType,
 		AuditStatus:   1, // pending
 		AuditMsg:      nil,
 	}
@@ -284,6 +299,13 @@ func since(t time.Time) string { return time.Since(t).String() }
 
 // enrichPostWithUserTag adds user tag information to post response
 func (h *PostHandler) enrichPostWithUserTag(post *model.Post) gin.H {
+	cardType := "confession"
+	if post.CardType != nil {
+		trimmed := strings.TrimSpace(*post.CardType)
+		if trimmed != "" {
+			cardType = trimmed
+		}
+	}
 	result := gin.H{
 		"id":                      post.ID,
 		"author_id":               post.AuthorID,
@@ -295,10 +317,12 @@ func (h *PostHandler) enrichPostWithUserTag(post *model.Post) gin.H {
 		"is_pinned":               post.IsPinned,
 		"is_featured":             post.IsFeatured,
 		"confessor_mode":          post.ConfessorMode,
+		"card_type":               cardType,
 		"metadata":                post.Metadata,
 		"created_at":              post.CreatedAt,
 		"updated_at":              post.UpdatedAt,
 		"author_tag":              nil,
+		"author_isadmin":          false,
 		"view_count":              post.ViewCount,
 		"comment_count":           post.CommentCount,
 		"audit_status":            post.AuditStatus,
@@ -306,13 +330,25 @@ func (h *PostHandler) enrichPostWithUserTag(post *model.Post) gin.H {
 		"manual_review_requested": post.ManualReviewRequested,
 	}
 
-	// Get author's active tag
+	// Get author's active tag and admin status
 	if tag, err := h.tagService.GetActiveUserTag(post.AuthorID); err == nil && tag != nil {
 		result["author_tag"] = gin.H{
 			"name":             tag.Name,
 			"title":            tag.Title,
 			"background_color": tag.BackgroundColor,
 			"text_color":       tag.TextColor,
+		}
+	}
+
+	// Check author admin permission
+	var user model.User
+	if err := h.db.Select("is_superadmin").First(&user, "id = ? AND deleted_at IS NULL", post.AuthorID).Error; err == nil {
+		if user.IsSuperadmin {
+			result["author_isadmin"] = true
+		} else {
+			var cnt int64
+			h.db.Model(&model.UserPermission{}).Where("user_id = ? AND deleted_at IS NULL", post.AuthorID).Count(&cnt)
+			result["author_isadmin"] = cnt > 0
 		}
 	}
 

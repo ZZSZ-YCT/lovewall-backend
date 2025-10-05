@@ -84,8 +84,75 @@ func AutoMigrate(db *gorm.DB) error {
 		return err
 	}
 
+	// Auto-migrate card_type column
+	if err := MigrateCardType(db); err != nil {
+		return err
+	}
+
 	// Auto-migrate permissions after schema migration
 	return MigratePermissions(db)
+}
+
+// MigrateCardType adds card_type column to posts table if it doesn't exist
+func MigrateCardType(db *gorm.DB) error {
+	// Check if card_type column already exists
+	var columns []struct {
+		Name string
+	}
+	if err := db.Raw("PRAGMA table_info(posts)").Scan(&columns).Error; err != nil {
+		return fmt.Errorf("failed to check posts table schema: %w", err)
+	}
+
+	cardTypeExists := false
+	for _, col := range columns {
+		if col.Name == "card_type" {
+			cardTypeExists = true
+			break
+		}
+	}
+
+	if cardTypeExists {
+		log.Println("card_type migration already applied, skipping")
+		return nil
+	}
+
+	log.Println("Applying card_type migration...")
+
+	// Execute migration in transaction
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	// Add card_type column
+	if err := tx.Exec("ALTER TABLE posts ADD COLUMN card_type TEXT NOT NULL DEFAULT 'confession';").Error; err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to add card_type column: %w", err)
+	}
+
+	// Create index
+	if err := tx.Exec("CREATE INDEX IF NOT EXISTS idx_posts_card_type ON posts(card_type);").Error; err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to create card_type index: %w", err)
+	}
+
+	// Backfill existing data
+	if err := tx.Exec("UPDATE posts SET card_type = 'confession' WHERE card_type IS NULL OR card_type = '';").Error; err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to backfill card_type: %w", err)
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return fmt.Errorf("failed to commit card_type migration: %w", err)
+	}
+
+	log.Println("card_type migration completed successfully")
+	return nil
 }
 
 // MigratePermissions migrates old permissions to new granular permission system

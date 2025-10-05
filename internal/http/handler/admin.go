@@ -135,7 +135,7 @@ func (h *AdminHandler) ListUsers(c *gin.Context) {
 	}
 	items := make([]gin.H, 0, len(users))
 	for i := range users {
-		u := sanitizeUser(&users[i])
+		u := sanitizeUser(h.db, &users[i])
 		u["permissions"] = permMap[users[i].ID]
 		items = append(items, u)
 	}

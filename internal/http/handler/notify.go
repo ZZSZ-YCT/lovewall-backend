@@ -50,3 +50,16 @@ func (h *NotifyHandler) MarkRead(c *gin.Context) {
 	}
 	c.Status(http.StatusNoContent)
 }
+
+// GET /api/notifications/unread-count (auth)
+func (h *NotifyHandler) UnreadCount(c *gin.Context) {
+	uid, _ := c.Get(mw.CtxUserID)
+	var count int64
+	if err := h.db.Model(&model.Notification{}).
+		Where("user_id = ? AND is_read = ? AND deleted_at IS NULL", uid, false).
+		Count(&count).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+		return
+	}
+	basichttp.OK(c, gin.H{"count": count})
+}

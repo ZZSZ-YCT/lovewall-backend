@@ -146,6 +146,7 @@ func main() {
 	authed.GET("/posts/moderation", postH.ListModeration)
 
 	authed.POST("/announcements", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.Create)
+	authed.GET("/announcements/admin", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.AdminList)
 	authed.PUT("/announcements/:id", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.Update)
 	authed.DELETE("/announcements/:id", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.Delete)
 	authed.POST("/admin/posts/:id/approve", adminH.ApprovePost)
@@ -198,9 +199,10 @@ func main() {
 	authed.POST("/my/tags/:tag_id/activate", tagH.SetActiveTag)
 	// Notifications
 	authed.GET("/notifications", notifyH.List)
+	authed.GET("/notifications/unread-count", notifyH.UnreadCount)
 	authed.POST("/notifications/:id/read", notifyH.MarkRead)
 
-	addr := fmt.Sprintf(":%d", cfg.Port)
+	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
 	if err := http.ListenAndServe(addr, r); err != nil {
 		zap.L().Fatal("server error", zap.Error(err))
 	}

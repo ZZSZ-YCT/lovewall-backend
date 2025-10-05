@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"strings"
 
 	"gorm.io/gorm"
 	"lovewall/internal/model"
@@ -54,8 +55,15 @@ func moderatePostV2(db *gorm.DB, cfg aiConfigProvider, id string) {
 	if err := db.First(&p, "id = ?", id).Error; err != nil {
 		return
 	}
-	ctxText := "作者:" + p.AuthorName + "\n对象:" + p.TargetName + "\n内容:" + p.Content
-	res, _ := ModerateWithRetry(context.Background(), NewConfigAdapter(cfg.GetAIBaseURL(), cfg.GetAIAPIKey(), cfg.GetAIModel()), BuildPostPrompt(ctxText))
+	cardType := "confession"
+	if p.CardType != nil {
+		trimmed := strings.TrimSpace(*p.CardType)
+		if trimmed != "" {
+			cardType = strings.ToLower(trimmed)
+		}
+	}
+	ctxText := "CardType:" + cardType + "\n作者:" + p.AuthorName + "\n对象:" + p.TargetName + "\n内容:" + p.Content
+	res, _ := ModerateWithRetry(context.Background(), NewConfigAdapter(cfg.GetAIBaseURL(), cfg.GetAIAPIKey(), cfg.GetAIModel()), BuildPostPrompt(ctxText, cardType))
 	score, msg := 95, ""
 	if res != nil {
 		score = res.Score
@@ -74,6 +82,7 @@ func moderatePostV2(db *gorm.DB, cfg aiConfigProvider, id string) {
 			"content_preview": contentPreview,
 			"author_name":     p.AuthorName,
 			"target_name":     p.TargetName,
+			"card_type":       cardType,
 		})
 
 		tx := db.Begin()
@@ -103,6 +112,7 @@ func moderatePostV2(db *gorm.DB, cfg aiConfigProvider, id string) {
 			"content_preview": contentPreview,
 			"author_name":     p.AuthorName,
 			"target_name":     p.TargetName,
+			"card_type":       cardType,
 		})
 
 		_ = db.Model(&model.Post{}).Where("id = ?", id).Updates(map[string]any{"status": 1, "audit_status": 1, "audit_msg": fmt.Sprintf("AI评分 %d：%s", score, msg), "manual_review_requested": true}).Error
@@ -180,8 +190,15 @@ func moderatePost(db *gorm.DB, cfg aiConfigProvider, id string) {
 		return
 	}
 	// Build context
-	ctxText := "作者:" + p.AuthorName + "\n对象:" + p.TargetName + "\n内容:" + p.Content
-	res, _ := ModerateWithRetry(context.Background(), NewConfigAdapter(cfg.GetAIBaseURL(), cfg.GetAIAPIKey(), cfg.GetAIModel()), BuildPostPrompt(ctxText))
+	cardType := "confession"
+	if p.CardType != nil {
+		trimmed := strings.TrimSpace(*p.CardType)
+		if trimmed != "" {
+			cardType = strings.ToLower(trimmed)
+		}
+	}
+	ctxText := "CardType:" + cardType + "\n作者:" + p.AuthorName + "\n对象:" + p.TargetName + "\n内容:" + p.Content
+	res, _ := ModerateWithRetry(context.Background(), NewConfigAdapter(cfg.GetAIBaseURL(), cfg.GetAIAPIKey(), cfg.GetAIModel()), BuildPostPrompt(ctxText, cardType))
 	if res != nil && !res.Audit {
 		msg := res.Msg
 		_ = db.Model(&model.Post{}).Where("id = ?", id).Updates(map[string]any{

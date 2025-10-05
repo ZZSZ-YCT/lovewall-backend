@@ -86,6 +86,7 @@ type Post struct {
 	IsFeatured bool    `gorm:"not null;default:false;index" json:"is_featured"`
 	// confessor_mode: "self" uses current user's display name; "custom" uses stored AuthorName
 	ConfessorMode *string `gorm:"not null;default:custom" json:"confessor_mode"`
+	CardType      *string `gorm:"not null;default:confession;index" json:"card_type"`
 	Metadata      *string `json:"metadata,omitempty"`
 
 	// Stats

@@ -96,7 +96,7 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	if h.cfg.CookieName != "" {
 		c.SetCookie(h.cfg.CookieName, token, int(h.cfg.JWTTTL), "/", "", true, true)
 	}
-	basichttp.OK(c, gin.H{"user": sanitizeUser(u), "access_token": token})
+	basichttp.OK(c, gin.H{"user": sanitizeUser(h.db, u), "access_token": token})
 }
 
 type LoginRequest struct {
@@ -146,7 +146,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	if h.cfg.CookieName != "" {
 		c.SetCookie(h.cfg.CookieName, token, int(h.cfg.JWTTTL), "/", "", true, true)
 	}
-	basichttp.OK(c, gin.H{"user": sanitizeUser(&u), "access_token": token})
+	basichttp.OK(c, gin.H{"user": sanitizeUser(h.db, &u), "access_token": token})
 }
 
 func (h *AuthHandler) Logout(c *gin.Context) {
@@ -314,10 +314,24 @@ func (h *AuthHandler) Profile(c *gin.Context) {
 	for _, p := range perms {
 		pstrs = append(pstrs, p.Permission)
 	}
-	basichttp.OK(c, gin.H{"user": sanitizeUser(&u), "permissions": pstrs})
+	basichttp.OK(c, gin.H{"user": sanitizeUser(h.db, &u), "permissions": pstrs})
 }
 
-func sanitizeUser(u *model.User) gin.H {
+// hasAnyAdminPermission checks if user has superadmin flag or any permission
+func hasAnyAdminPermission(db *gorm.DB, userID string) bool {
+	var u model.User
+	if err := db.Select("is_superadmin").First(&u, "id = ? AND deleted_at IS NULL", userID).Error; err != nil {
+		return false
+	}
+	if u.IsSuperadmin {
+		return true
+	}
+	var cnt int64
+	db.Model(&model.UserPermission{}).Where("user_id = ? AND deleted_at IS NULL", userID).Count(&cnt)
+	return cnt > 0
+}
+
+func sanitizeUser(db *gorm.DB, u *model.User) gin.H {
 	return gin.H{
 		"id":            u.ID,
 		"username":      u.Username,
@@ -336,17 +350,19 @@ func sanitizeUser(u *model.User) gin.H {
 		"created_at":    u.CreatedAt,
 		"updated_at":    u.UpdatedAt,
 		"isdeleted":     u.DeletedAt != nil,
+		"isadmin":       hasAnyAdminPermission(db, u.ID),
 	}
 }
 
 // Public-facing user response (no email/phone/sensitive fields)
-func sanitizeUserPublic(u *model.User) gin.H {
+func sanitizeUserPublic(db *gorm.DB, u *model.User) gin.H {
 	if u.IsBanned {
 		return gin.H{
 			"id":        u.ID,
 			"username":  u.Username,
 			"is_banned": true,
 			"isdeleted": u.DeletedAt != nil,
+			"isadmin":   hasAnyAdminPermission(db, u.ID),
 		}
 	}
 	return gin.H{
@@ -358,6 +374,7 @@ func sanitizeUserPublic(u *model.User) gin.H {
 		"created_at":   u.CreatedAt,
 		"updated_at":   u.UpdatedAt,
 		"isdeleted":    u.DeletedAt != nil,
+		"isadmin":      hasAnyAdminPermission(db, u.ID),
 	}
 }
 
@@ -540,7 +557,7 @@ func (h *AuthHandler) UpdateUser(c *gin.Context) {
 	}
 
 	if len(updates) == 0 {
-		basichttp.OK(c, sanitizeUser(&user))
+		basichttp.OK(c, sanitizeUser(h.db, &user))
 		return
 	}
 
@@ -580,7 +597,7 @@ func (h *AuthHandler) UpdateUser(c *gin.Context) {
 			}
 		}
 	}
-	basichttp.OK(c, sanitizeUser(&user))
+	basichttp.OK(c, sanitizeUser(h.db, &user))
 }
 
 // PATCH /api/profile (auth)
@@ -758,7 +775,7 @@ func (h *AuthHandler) UpdateProfile(c *gin.Context) {
 	}
 
 	if len(updates) == 0 {
-		basichttp.OK(c, sanitizeUser(&user))
+		basichttp.OK(c, sanitizeUser(h.db, &user))
 		return
 	}
 	if err := h.db.Model(&user).Updates(updates).Error; err != nil {
@@ -773,7 +790,7 @@ func (h *AuthHandler) UpdateProfile(c *gin.Context) {
 	if oldAvatarPathToDelete != "" {
 		_ = os.Remove(oldAvatarPathToDelete)
 	}
-	basichttp.OK(c, sanitizeUser(&user))
+	basichttp.OK(c, sanitizeUser(h.db, &user))
 }
 
 func fmtInt64(i int64) string { return strconv.FormatInt(i, 10) }
@@ -799,7 +816,7 @@ func (h *AuthHandler) GetUserPublicByID(c *gin.Context) {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
 		return
 	}
-	basichttp.OK(c, sanitizeUserPublic(&u))
+	basichttp.OK(c, sanitizeUserPublic(h.db, &u))
 }
 
 // GET /api/users/by-username/:username (public)
@@ -810,7 +827,7 @@ func (h *AuthHandler) GetUserPublicByUsername(c *gin.Context) {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
 		return
 	}
-	basichttp.OK(c, sanitizeUserPublic(&u))
+	basichttp.OK(c, sanitizeUserPublic(h.db, &u))
 }
 
 // GET /api/users/:id/status (public)

@@ -68,6 +68,7 @@ func (h *CommentHandler) enrichCommentWithUserTag(comment *model.Comment) gin.H 
 		"updated_at":        comment.UpdatedAt,
 		"user_tag":          nil,
 		"user_display_name": nil,
+		"user_isadmin":      false,
 	}
 
 	// Get user's active tag
@@ -80,14 +81,22 @@ func (h *CommentHandler) enrichCommentWithUserTag(comment *model.Comment) gin.H 
 		}
 	}
 
-	// Attach user's current display name (fallback to username if empty)
+	// Attach user's current display name (fallback to username if empty) and admin status
 	var user model.User
-	if err := h.db.Unscoped().Select("username, display_name").First(&user, "id = ?", comment.UserID).Error; err == nil {
+	if err := h.db.Unscoped().Select("id, username, display_name, is_superadmin").First(&user, "id = ?", comment.UserID).Error; err == nil {
 		result["user_username"] = user.Username
 		if user.DisplayName != nil && *user.DisplayName != "" {
 			result["user_display_name"] = *user.DisplayName
 		} else {
 			result["user_display_name"] = user.Username
+		}
+		// Check admin permission
+		if user.IsSuperadmin {
+			result["user_isadmin"] = true
+		} else {
+			var cnt int64
+			h.db.Model(&model.UserPermission{}).Where("user_id = ? AND deleted_at IS NULL", user.ID).Count(&cnt)
+			result["user_isadmin"] = cnt > 0
 		}
 	}
 
