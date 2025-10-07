@@ -182,30 +182,19 @@ func (h *TagHandler) DeleteTag(c *gin.Context) {
 	}
 	// Cascade delete related records in a transaction
 	tx := h.db.Begin()
-	// 1) Find all users who have this tag
-	var userIDs []string
-	if err := tx.Model(&model.UserTag{}).
-		Where("tag_id = ? AND deleted_at IS NULL", id).
-		Pluck("user_id", &userIDs).Error; err != nil {
+	// 1) Delete only the user_tag entries that reference this tag
+	if err := tx.Unscoped().Where("tag_id = ?", id).Delete(&model.UserTag{}).Error; err != nil {
 		tx.Rollback()
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete user tags failed")
 		return
 	}
-	// 2) Delete ALL tags of those users (as per requirement)
-	if len(userIDs) > 0 {
-		if err := tx.Unscoped().Where("user_id IN ?", userIDs).Delete(&model.UserTag{}).Error; err != nil {
-			tx.Rollback()
-			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete user tags failed")
-			return
-		}
-	}
-	// 3) Delete all redemption codes (used or not) belonging to this tag
+	// 2) Delete all redemption codes (used or not) belonging to this tag
 	if err := tx.Unscoped().Where("tag_id = ?", id).Delete(&model.RedemptionCode{}).Error; err != nil {
 		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete codes failed")
 		return
 	}
-	// 4) Hard delete the tag itself
+	// 3) Hard delete the tag itself
 	if err := tx.Unscoped().Delete(&tag).Error; err != nil {
 		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete tag failed")
