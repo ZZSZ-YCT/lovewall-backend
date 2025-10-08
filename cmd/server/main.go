@@ -42,6 +42,9 @@ func main() {
 	// Start moderation worker (async AI review)
 	service.StartModerationWorker(database, service.NewConfigAdapter(cfg.AIBaseURL, cfg.AIAPIKey, cfg.AIModel))
 
+	// Start heartbeat monitor for user online status tracking
+	service.StartHeartbeatMonitor(database)
+
 	// Start async writer for request logs to reduce SQLite write contention
 	mw.StartRequestLogWriter(database)
 
@@ -98,6 +101,7 @@ func main() {
 	tagH := handler.NewTagHandler(database, cfg)
 	logH := handler.NewLogHandler(database, cfg)
 	notifyH := handler.NewNotifyHandler(database, cfg)
+	onlineH := handler.NewOnlineHandler(database, cfg)
 
 	api.POST("/register", authH.Register)
 	api.POST("/login", authH.Login)
@@ -110,6 +114,8 @@ func main() {
 	// Public: fetch user's active tag by ID/username
 	api.GET("/users/:id/active-tag", authH.GetUserActiveTagByID)
 	api.GET("/users/by-username/:username/active-tag", authH.GetUserActiveTagByUsername)
+	// Public: fetch user's online status
+	api.GET("/users/:id/online", onlineH.GetUserOnlineStatus)
 	api.GET("/posts", postH.ListPosts)
 	api.GET("/posts/:id", postH.GetPost)
 	api.GET("/users/:id/posts", postH.ListByUser)
@@ -125,6 +131,7 @@ func main() {
 	authed.PATCH("/profile", authH.UpdateProfile)
 	authed.PUT("/me/password", authH.ChangeMyPassword)
 	authed.GET("/users/me/online", authH.OnlineStatus)
+	authed.POST("/heartbeat", authH.Heartbeat)
 	// Note: Logout is already exposed at /api/logout (public).
 	// The handler supports token extraction and blacklist, so a second
 	// registration here would duplicate the same route and cause a panic.

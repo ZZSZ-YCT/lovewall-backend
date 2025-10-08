@@ -89,6 +89,11 @@ func AutoMigrate(db *gorm.DB) error {
 		return err
 	}
 
+	// Auto-migrate online status columns
+	if err := MigrateOnlineStatus(db); err != nil {
+		return err
+	}
+
 	// Auto-migrate permissions after schema migration
 	return MigratePermissions(db)
 }
@@ -152,6 +157,69 @@ func MigrateCardType(db *gorm.DB) error {
 	}
 
 	log.Println("card_type migration completed successfully")
+	return nil
+}
+
+// MigrateOnlineStatus adds is_online and last_heartbeat columns to users table if they don't exist
+func MigrateOnlineStatus(db *gorm.DB) error {
+	var columns []struct {
+		Name string
+	}
+	if err := db.Raw("PRAGMA table_info(users)").Scan(&columns).Error; err != nil {
+		return fmt.Errorf("failed to check users table schema: %w", err)
+	}
+
+	isOnlineExists := false
+	lastHeartbeatExists := false
+	for _, col := range columns {
+		if col.Name == "is_online" {
+			isOnlineExists = true
+		}
+		if col.Name == "last_heartbeat" {
+			lastHeartbeatExists = true
+		}
+	}
+
+	if isOnlineExists && lastHeartbeatExists {
+		log.Println("online status migration already applied, skipping")
+		return nil
+	}
+
+	log.Println("Applying online status migration...")
+
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	if !isOnlineExists {
+		if err := tx.Exec("ALTER TABLE users ADD COLUMN is_online INTEGER NOT NULL DEFAULT 0;").Error; err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to add is_online column: %w", err)
+		}
+		if err := tx.Exec("CREATE INDEX IF NOT EXISTS idx_users_is_online ON users(is_online);").Error; err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to create is_online index: %w", err)
+		}
+	}
+
+	if !lastHeartbeatExists {
+		if err := tx.Exec("ALTER TABLE users ADD COLUMN last_heartbeat DATETIME;").Error; err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to add last_heartbeat column: %w", err)
+		}
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return fmt.Errorf("failed to commit online status migration: %w", err)
+	}
+
+	log.Println("online status migration completed successfully")
 	return nil
 }
 

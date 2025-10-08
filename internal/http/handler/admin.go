@@ -346,6 +346,7 @@ func (h *AdminHandler) ApprovePost(c *gin.Context) {
 }
 
 // POST /api/admin/posts/:id/reject (auth; MANAGE_POSTS or superadmin)
+// Rejects and permanently deletes the post along with its comments and images
 func (h *AdminHandler) RejectPost(c *gin.Context) {
 	id := c.Param("id")
 	if !mw.IsSuper(c) {
@@ -362,14 +363,49 @@ func (h *AdminHandler) RejectPost(c *gin.Context) {
 		Reason string `json:"reason"`
 	}
 	_ = c.ShouldBindJSON(&body)
-	var reasonPtr *string
-	if body.Reason != "" {
-		reasonPtr = &body.Reason
-	}
-	updates := map[string]any{"status": 1, "audit_status": 2, "audit_msg": reasonPtr, "manual_review_requested": false}
-	if err := h.db.Model(&model.Post{}).Where("id = ? AND deleted_at IS NULL", id).Updates(updates).Error; err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "reject failed")
+
+	// Fetch post to notify author
+	var p model.Post
+	if err := h.db.First(&p, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found")
 		return
 	}
-	basichttp.OK(c, gin.H{"id": id, "rejected": true})
+
+	// Hard delete post and related data
+	tx := h.db.Begin()
+	if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.Comment{}).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+		return
+	}
+	if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.PostImage{}).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+		return
+	}
+	if err := tx.Unscoped().Delete(&p).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+		return
+	}
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+		return
+	}
+
+	// Notify author
+	reason := body.Reason
+	if reason == "" {
+		reason = "审核未通过"
+	}
+	service.Notify(h.db, p.AuthorID, "帖子审核未通过", "你的帖子未通过审核已被删除,原因:"+reason, map[string]any{"post_id": p.ID})
+
+	// Log operation
+	if uid, ok := c.Get(mw.CtxUserID); ok {
+		if uidStr, ok2 := uid.(string); ok2 {
+			service.LogOperation(h.db, uidStr, "reject_post", "post", id, map[string]any{"reason": reason})
+		}
+	}
+
+	basichttp.OK(c, gin.H{"id": id, "rejected": true, "deleted": true})
 }

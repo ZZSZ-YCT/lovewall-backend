@@ -36,8 +36,12 @@ func NewAuthHandler(db *gorm.DB, cfg *config.Config) *AuthHandler {
 }
 
 type RegisterRequest struct {
-	Username string `json:"username" binding:"required,min=3,max=32"`
-	Password string `json:"password" binding:"required,min=6,max=64"`
+	Username      string `json:"username" binding:"required,min=3,max=32"`
+	Password      string `json:"password" binding:"required,min=6,max=64"`
+	LotNumber     string `json:"lot_number"`
+	CaptchaOutput string `json:"captcha_output"`
+	PassToken     string `json:"pass_token"`
+	GenTime       string `json:"gen_time"`
 }
 
 func (h *AuthHandler) Register(c *gin.Context) {
@@ -46,6 +50,30 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid payload")
 		return
 	}
+
+	// Verify Geetest CAPTCHA if configured
+	validator := service.NewGeetestValidator(h.cfg.GeetestCaptchaID, h.cfg.GeetestCaptchaKey)
+	if validator.IsEnabled() {
+		// Validate all CAPTCHA fields are present
+		if req.LotNumber == "" || req.CaptchaOutput == "" || req.PassToken == "" || req.GenTime == "" {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "captcha validation required")
+			return
+		}
+
+		// Verify CAPTCHA with Geetest API
+		geetestReq := &service.GeetestValidateRequest{
+			LotNumber:     req.LotNumber,
+			CaptchaOutput: req.CaptchaOutput,
+			PassToken:     req.PassToken,
+			GenTime:       req.GenTime,
+		}
+		valid, err := validator.Validate(geetestReq)
+		if err != nil || !valid {
+			basichttp.Fail(c, http.StatusUnauthorized, "CAPTCHA_FAILED", "captcha verification failed")
+			return
+		}
+	}
+
 	req.Username = strings.TrimSpace(req.Username)
 	var count int64
 	h.db.Model(&model.User{}).Where("username = ?", req.Username).Count(&count)
@@ -72,11 +100,16 @@ func (h *AuthHandler) Register(c *gin.Context) {
 			isSuper = true
 		}
 	}
+	// Record registration time and IP
+	now := time.Now()
+	ip := c.ClientIP()
 	u := &model.User{
 		Username:     req.Username,
 		PasswordHash: string(hashed),
 		IsSuperadmin: isSuper,
 		Status:       0,
+		LastLoginAt:  &now,
+		LastIP:       &ip,
 	}
 	if err := h.db.Create(u).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create user")
@@ -232,16 +265,39 @@ func (h *AuthHandler) ChangeMyPassword(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// GET /api/users/me/online (auth) — simple online indicator
+// GET /api/users/me/online (auth) — online status based on heartbeat
 func (h *AuthHandler) OnlineStatus(c *gin.Context) {
-	// If request reaches here, token is valid and not blacklisted
-	resp := gin.H{"online": true}
+	uid, _ := c.Get(mw.CtxUserID)
+	var u model.User
+	if err := h.db.Select("is_online, last_heartbeat").First(&u, "id = ?", uid).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+		return
+	}
+	resp := gin.H{
+		"online":         u.IsOnline,
+		"last_heartbeat": u.LastHeartbeat,
+	}
 	if v, ok := c.Get(mw.CtxTokenExp); ok {
 		if t, ok2 := v.(time.Time); ok2 {
 			resp["expires_at"] = t
+			resp["token_expires_at"] = t
 		}
 	}
 	basichttp.OK(c, resp)
+}
+
+// POST /api/heartbeat (auth) — update user heartbeat
+func (h *AuthHandler) Heartbeat(c *gin.Context) {
+	uid, _ := c.Get(mw.CtxUserID)
+	now := time.Now()
+	if err := h.db.Model(&model.User{}).Where("id = ?", uid).Updates(map[string]any{
+		"is_online":      true,
+		"last_heartbeat": now,
+	}).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "heartbeat update failed")
+		return
+	}
+	basichttp.OK(c, gin.H{"online": true, "timestamp": now})
 }
 
 // helpers
@@ -420,6 +476,19 @@ func (h *AuthHandler) UpdateUser(c *gin.Context) {
 	if err := h.db.First(&user, "id = ? AND deleted_at IS NULL", userID).Error; err != nil {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
 		return
+	}
+
+	// Prevent non-superadmin from modifying superadmin accounts
+	if user.IsSuperadmin && !isSelf {
+		var currentUser model.User
+		if err := h.db.Select("is_superadmin").First(&currentUser, "id = ?", currentUID).Error; err != nil {
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "permission check failed")
+			return
+		}
+		if !currentUser.IsSuperadmin {
+			basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "cannot modify superadmin")
+			return
+		}
 	}
 
 	updates := make(map[string]interface{})

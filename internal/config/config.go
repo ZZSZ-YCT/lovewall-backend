@@ -39,6 +39,9 @@ type Config struct {
 	QuotaCommentsPerIPPerHour   int // default 10
 	MaxPostChars                int // default 2000
 	MaxCommentChars             int // default 500
+	// Geetest captcha
+	GeetestCaptchaID  string // Geetest public key (captcha_id)
+	GeetestCaptchaKey string // Geetest private key (captcha_key)
 }
 
 func getenv(key, def string) string {
@@ -119,5 +122,7 @@ func Load() *Config {
 		QuotaCommentsPerIPPerHour:   getinti("QUOTA_COMMENTS_PER_IP_PER_HOUR", 10),
 		MaxPostChars:                getinti("MAX_POST_CHARS", 2000),
 		MaxCommentChars:             getinti("MAX_COMMENT_CHARS", 500),
+		GeetestCaptchaID:            getenv("GEETEST_CAPTCHA_ID", ""),
+		GeetestCaptchaKey:           getenv("GEETEST_CAPTCHA_KEY", ""),
 	}
 }

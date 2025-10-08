@@ -43,21 +43,23 @@ func (base *BaseModel) BeforeCreate(tx *gorm.DB) error {
 
 type User struct {
 	BaseModel
-	Username     string     `gorm:"uniqueIndex;not null" json:"username"`
-	DisplayName  *string    `json:"display_name"`
-	Email        *string    `gorm:"uniqueIndex" json:"email,omitempty"`
-	Phone        *string    `gorm:"uniqueIndex" json:"phone,omitempty"`
-	AvatarURL    *string    `json:"avatar_url,omitempty"`
-	Bio          *string    `json:"bio,omitempty"`
-	PasswordHash string     `json:"-"`
-	IsSuperadmin bool       `gorm:"not null;default:false" json:"is_superadmin"`
-	Status       int        `gorm:"not null;default:0" json:"status"`
-	IsBanned     bool       `gorm:"not null;default:false;index" json:"is_banned"`
-	BanReason    *string    `json:"ban_reason,omitempty"`
-	BannedAt     *time.Time `json:"banned_at,omitempty"`
-	LastLoginAt  *time.Time `json:"last_login_at,omitempty"`
-	LastIP       *string    `json:"last_ip,omitempty"`
-	Metadata     *string    `json:"metadata,omitempty"`
+	Username      string     `gorm:"uniqueIndex;not null" json:"username"`
+	DisplayName   *string    `json:"display_name"`
+	Email         *string    `gorm:"uniqueIndex" json:"email,omitempty"`
+	Phone         *string    `gorm:"uniqueIndex" json:"phone,omitempty"`
+	AvatarURL     *string    `json:"avatar_url,omitempty"`
+	Bio           *string    `json:"bio,omitempty"`
+	PasswordHash  string     `json:"-"`
+	IsSuperadmin  bool       `gorm:"not null;default:false" json:"is_superadmin"`
+	Status        int        `gorm:"not null;default:0" json:"status"`
+	IsBanned      bool       `gorm:"not null;default:false;index" json:"is_banned"`
+	BanReason     *string    `json:"ban_reason,omitempty"`
+	BannedAt      *time.Time `json:"banned_at,omitempty"`
+	LastLoginAt   *time.Time `json:"last_login_at,omitempty"`
+	IsOnline      bool       `gorm:"not null;default:false;index" json:"is_online"`
+	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
+	LastIP        *string    `json:"last_ip,omitempty"`
+	Metadata      *string    `json:"metadata,omitempty"`
 }
 
 type ExternalIdentity struct {

@@ -328,6 +328,7 @@ func (h *PostHandler) enrichPostWithUserTag(post *model.Post) gin.H {
 		"audit_status":            post.AuditStatus,
 		"audit_msg":               post.AuditMsg,
 		"manual_review_requested": post.ManualReviewRequested,
+		"is_pending_review":       post.AuditStatus == 1,
 	}
 
 	// Get author's active tag and admin status
@@ -595,34 +596,47 @@ func (h *PostHandler) Hide(c *gin.Context) {
 		return
 	}
 	id := c.Param("id")
+
+	// 检查帖子是否存在及审核状态
+	var p model.Post
+	if err := h.db.First(&p, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found")
+		return
+	}
+
+	// 禁止取消隐藏待审核帖子
+	if !body.Hide && p.AuditStatus == 1 {
+		basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "cannot unhide pending review post, use approve instead")
+		return
+	}
+
 	newStatus := 0
 	if body.Hide {
 		newStatus = 1
 	}
-	if err := h.db.Model(&model.Post{}).Where("id = ? AND deleted_at IS NULL", id).Update("status", newStatus).Error; err != nil {
+	if err := h.db.Model(&model.Post{}).Where("id = ?", id).Update("status", newStatus).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
 		return
 	}
-	var p model.Post
-	if err := h.db.First(&p, "id = ?", id).Error; err == nil {
-		operator := h.resolveOperatorName(c)
-		title := "帖子取消隐藏"
-		reason := strings.TrimSpace(h.pickReason(body.Reason))
-		if body.Hide {
-			title = "帖子被隐藏"
-			if reason == "" {
-				if p.AuditMsg != nil && strings.TrimSpace(*p.AuditMsg) != "" {
-					reason = *p.AuditMsg
-				} else {
-					reason = "管理员暂时隐藏了该帖子，等待内容调整或人工复核。"
-				}
+
+	operator := h.resolveOperatorName(c)
+	title := "帖子取消隐藏"
+	reason := strings.TrimSpace(h.pickReason(body.Reason))
+	if body.Hide {
+		title = "帖子被隐藏"
+		if reason == "" {
+			if p.AuditMsg != nil && strings.TrimSpace(*p.AuditMsg) != "" {
+				reason = *p.AuditMsg
+			} else {
+				reason = "管理员暂时隐藏了该帖子，等待内容调整或人工复核。"
 			}
-		} else if reason == "" {
-			reason = "管理员重新开放了该帖子，现已对所有用户可见。"
 		}
-		content := h.buildPostNotificationContent(title, &p, operator, reason)
-		service.Notify(h.db, p.AuthorID, title, content, map[string]any{"post_id": p.ID})
+	} else if reason == "" {
+		reason = "管理员重新开放了该帖子，现已对所有用户可见。"
 	}
+	content := h.buildPostNotificationContent(title, &p, operator, reason)
+	service.Notify(h.db, p.AuthorID, title, content, map[string]any{"post_id": p.ID})
+
 	if uid, ok := c.Get(mw.CtxUserID); ok {
 		if uidStr, ok2 := uid.(string); ok2 {
 			action := "unhide_post"
