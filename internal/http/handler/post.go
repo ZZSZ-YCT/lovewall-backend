@@ -322,7 +322,7 @@ func (h *PostHandler) enrichPostWithUserTag(post *model.Post) gin.H {
 		"created_at":              post.CreatedAt,
 		"updated_at":              post.UpdatedAt,
 		"author_tag":              nil,
-		"author_isadmin":          false,
+		"is_author_admin":         false,
 		"view_count":              post.ViewCount,
 		"comment_count":           post.CommentCount,
 		"audit_status":            post.AuditStatus,
@@ -345,11 +345,11 @@ func (h *PostHandler) enrichPostWithUserTag(post *model.Post) gin.H {
 	var user model.User
 	if err := h.db.Select("is_superadmin").First(&user, "id = ? AND deleted_at IS NULL", post.AuthorID).Error; err == nil {
 		if user.IsSuperadmin {
-			result["author_isadmin"] = true
+			result["is_author_admin"] = true
 		} else {
 			var cnt int64
 			h.db.Model(&model.UserPermission{}).Where("user_id = ? AND deleted_at IS NULL", post.AuthorID).Count(&cnt)
-			result["author_isadmin"] = cnt > 0
+			result["is_author_admin"] = cnt > 0
 		}
 	}
 

@@ -10,7 +10,7 @@
   - `POST /api/posts/{id}/feature`
   - `POST /api/posts/{id}/hide`
   请求体可携带 `{ "reason": "字符串" }`，若缺省后端会填充默认说明；该理由将同步展示在通知 HTML 中。
-- 403 登录校验新增 `ACCOUNT_DELETED`：持有有效 Token 但账号已被软删除时返回 `{"success":false,"error":{"code":"ACCOUNT_DELETED",...},"isdeleted":true}`，前端可据此提示用户账号状态。
+- 403 登录校验新增 `ACCOUNT_DELETED`：持有有效 Token 但账号已被软删除时返回 `{"success":false,"error":{"code":"ACCOUNT_DELETED",...},"is_deleted":true}`，前端可据此提示用户账号状态。
 
 ## 管理员帖子列表（含隐藏/已删除）
 - 方法: `GET`

@@ -275,7 +275,7 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 			service.LogOperation(h.db, uidStr, "delete_user", "user", id, nil)
 		}
 	}
-	basichttp.OK(c, gin.H{"id": id, "deleted": true, "isdeleted": true})
+	basichttp.OK(c, gin.H{"id": id, "deleted": true, "is_deleted": true})
 }
 
 // GET /api/admin/metrics/overview (auth; MANAGE_USERS or super)

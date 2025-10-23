@@ -405,8 +405,8 @@ func sanitizeUser(db *gorm.DB, u *model.User) gin.H {
 		"metadata":      u.Metadata,
 		"created_at":    u.CreatedAt,
 		"updated_at":    u.UpdatedAt,
-		"isdeleted":     u.DeletedAt != nil,
-		"isadmin":       hasAnyAdminPermission(db, u.ID),
+		"is_deleted":    u.DeletedAt != nil,
+		"is_admin":      hasAnyAdminPermission(db, u.ID),
 	}
 }
 
@@ -414,11 +414,11 @@ func sanitizeUser(db *gorm.DB, u *model.User) gin.H {
 func sanitizeUserPublic(db *gorm.DB, u *model.User) gin.H {
 	if u.IsBanned {
 		return gin.H{
-			"id":        u.ID,
-			"username":  u.Username,
-			"is_banned": true,
-			"isdeleted": u.DeletedAt != nil,
-			"isadmin":   hasAnyAdminPermission(db, u.ID),
+			"id":         u.ID,
+			"username":   u.Username,
+			"is_banned":  true,
+			"is_deleted": u.DeletedAt != nil,
+			"is_admin":   hasAnyAdminPermission(db, u.ID),
 		}
 	}
 	return gin.H{
@@ -429,8 +429,8 @@ func sanitizeUserPublic(db *gorm.DB, u *model.User) gin.H {
 		"status":       u.Status,
 		"created_at":   u.CreatedAt,
 		"updated_at":   u.UpdatedAt,
-		"isdeleted":    u.DeletedAt != nil,
-		"isadmin":      hasAnyAdminPermission(db, u.ID),
+		"is_deleted":   u.DeletedAt != nil,
+		"is_admin":     hasAnyAdminPermission(db, u.ID),
 	}
 }
 
@@ -874,7 +874,7 @@ func (h *AuthHandler) GetUserPublicByID(c *gin.Context) {
 			"id":         model.AI_SYSTEM_UUID,
 			"username":   "AI审核系统",
 			"is_banned":  false,
-			"isdeleted":  false,
+			"is_deleted": false,
 			"created_at": time.Time{},
 		})
 		return
@@ -907,9 +907,9 @@ func (h *AuthHandler) GetUserStatusByID(c *gin.Context) {
 	// Handle AI system user query
 	if id == model.AI_SYSTEM_UUID {
 		basichttp.OK(c, gin.H{
-			"exists":    true,
-			"isdeleted": false,
-			"is_banned": false,
+			"exists":     true,
+			"is_deleted": false,
+			"is_banned":  false,
 		})
 		return
 	}
@@ -919,7 +919,7 @@ func (h *AuthHandler) GetUserStatusByID(c *gin.Context) {
 		basichttp.OK(c, gin.H{"exists": false})
 		return
 	}
-	basichttp.OK(c, gin.H{"exists": true, "isdeleted": u.DeletedAt != nil, "is_banned": u.IsBanned})
+	basichttp.OK(c, gin.H{"exists": true, "is_deleted": u.DeletedAt != nil, "is_banned": u.IsBanned})
 }
 
 // GET /api/users/by-username/:username/status (public)
@@ -930,7 +930,7 @@ func (h *AuthHandler) GetUserStatusByUsername(c *gin.Context) {
 		basichttp.OK(c, gin.H{"exists": false})
 		return
 	}
-	basichttp.OK(c, gin.H{"exists": true, "isdeleted": u.DeletedAt != nil, "is_banned": u.IsBanned, "id": u.ID})
+	basichttp.OK(c, gin.H{"exists": true, "is_deleted": u.DeletedAt != nil, "is_banned": u.IsBanned, "id": u.ID})
 }
 
 // GET /api/users/:id/active-tag (public)

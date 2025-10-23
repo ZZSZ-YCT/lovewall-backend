@@ -435,7 +435,7 @@ func ValidateSessionAndUser(db *gorm.DB) gin.HandlerFunc {
 		}
 		// Soft-deleted user: surface dedicated marker to help frontend avoid generic errors
 		if u.DeletedAt != nil {
-			basichttp.FailWithExtras(c, http.StatusForbidden, "ACCOUNT_DELETED", "account has been deleted", gin.H{"isdeleted": true})
+			basichttp.FailWithExtras(c, http.StatusForbidden, "ACCOUNT_DELETED", "account has been deleted", gin.H{"is_deleted": true})
 			c.Abort()
 			return
 		}

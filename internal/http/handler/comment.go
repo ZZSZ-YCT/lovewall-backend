@@ -68,7 +68,7 @@ func (h *CommentHandler) enrichCommentWithUserTag(comment *model.Comment) gin.H 
 		"updated_at":        comment.UpdatedAt,
 		"user_tag":          nil,
 		"user_display_name": nil,
-		"user_isadmin":      false,
+		"is_user_admin":     false,
 	}
 
 	// Get user's active tag
@@ -92,11 +92,11 @@ func (h *CommentHandler) enrichCommentWithUserTag(comment *model.Comment) gin.H 
 		}
 		// Check admin permission
 		if user.IsSuperadmin {
-			result["user_isadmin"] = true
+			result["is_user_admin"] = true
 		} else {
 			var cnt int64
 			h.db.Model(&model.UserPermission{}).Where("user_id = ? AND deleted_at IS NULL", user.ID).Count(&cnt)
-			result["user_isadmin"] = cnt > 0
+			result["is_user_admin"] = cnt > 0
 		}
 	}
 
