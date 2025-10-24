@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -42,6 +43,13 @@ func (h *AdminHandler) SetUserPermissions(c *gin.Context) {
 	if err := h.db.First(&user, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
 		return
+	}
+	if user.IsSuperadmin {
+		currentUserID, _ := c.Get(mw.CtxUserID)
+		if currentUserID != id {
+			basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "cannot modify superadmin data")
+			return
+		}
 	}
 	var body permBody
 	if err := c.ShouldBindJSON(&body); err != nil {
@@ -167,6 +175,20 @@ func (h *AdminHandler) UpdateUserPassword(c *gin.Context) {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
 		return
 	}
+	if user.IsSuperadmin {
+		currentUserID, _ := c.Get(mw.CtxUserID)
+		if currentUserID != id {
+			basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "cannot modify superadmin data")
+			return
+		}
+	}
+	// Only superadmin can modify another admin's password
+	if hasAnyAdminPermission(h.db, id) {
+		if !mw.IsSuper(c) {
+			basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "only superadmin can modify admin password")
+			return
+		}
+	}
 	hashed, err := bcrypt.GenerateFromPassword([]byte(body.NewPassword), bcrypt.DefaultCost)
 	if err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "hash password failed")
@@ -207,6 +229,19 @@ func (h *AdminHandler) BanUser(c *gin.Context) {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid body")
 		return
 	}
+	var user model.User
+	if err := h.db.First(&user, "id = ? AND deleted_at IS NULL", id).Error; err == nil {
+		if user.IsSuperadmin {
+			currentUserID, _ := c.Get(mw.CtxUserID)
+			if currentUserID != id {
+				basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "cannot modify superadmin data")
+				return
+			}
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "ban failed")
+		return
+	}
 	now := time.Now()
 	updates := map[string]any{"is_banned": true, "ban_reason": body.Reason, "banned_at": now}
 	if err := h.db.Model(&model.User{}).Where("id = ? AND deleted_at IS NULL", id).Updates(updates).Error; err != nil {
@@ -235,6 +270,19 @@ func (h *AdminHandler) UnbanUser(c *gin.Context) {
 			return
 		}
 	}
+	var user model.User
+	if err := h.db.First(&user, "id = ? AND deleted_at IS NULL", id).Error; err == nil {
+		if user.IsSuperadmin {
+			currentUserID, _ := c.Get(mw.CtxUserID)
+			if currentUserID != id {
+				basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "cannot modify superadmin data")
+				return
+			}
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "unban failed")
+		return
+	}
 	updates := map[string]any{"is_banned": false, "ban_reason": nil, "banned_at": nil}
 	if err := h.db.Model(&model.User{}).Where("id = ? AND deleted_at IS NULL", id).Updates(updates).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "unban failed")
@@ -262,6 +310,13 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 	if err := h.db.First(&user, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
 		return
+	}
+	if user.IsSuperadmin {
+		currentUserID, _ := c.Get(mw.CtxUserID)
+		if currentUserID != id {
+			basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "cannot modify superadmin data")
+			return
+		}
 	}
 	if err := h.db.Delete(&user).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
