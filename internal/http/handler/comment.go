@@ -47,7 +47,7 @@ func (h *CommentHandler) ListForPost(c *gin.Context) {
 	var items []model.Comment
 	q := h.db.Model(&model.Comment{}).Where("post_id = ? AND deleted_at IS NULL AND status = 0", postID)
 	q.Count(&total)
-	if err := q.Order("created_at ASC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
+	if err := q.Order("is_pinned DESC, created_at ASC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
 		return
 	}
@@ -124,6 +124,19 @@ func (h *CommentHandler) Create(c *gin.Context) {
 	if err := h.db.First(&post, "id = ? AND deleted_at IS NULL AND status = 0", postID).Error; err != nil {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found")
 		return
+	}
+	// Check if post is locked (admins can still comment)
+	if post.IsLocked {
+		// Check if user is admin (superadmin or MANAGE_POSTS)
+		if !mw.IsSuper(c) {
+			uid, _ := c.Get(mw.CtxUserID)
+			var cnt int64
+			h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_POSTS").Scan(&cnt)
+			if cnt == 0 {
+				basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "post is locked")
+				return
+			}
+		}
 	}
 	var body createCommentBody
 	if err := c.ShouldBindJSON(&body); err != nil {
@@ -296,6 +309,78 @@ func (h *CommentHandler) Hide(c *gin.Context) {
 		}
 	}
 	basichttp.OK(c, gin.H{"id": id, "status": newStatus})
+}
+
+// PinComment pins a comment (MANAGE_POSTS or superadmin)
+// POST /api/admin/comments/:id/pin
+func (h *CommentHandler) PinComment(c *gin.Context) {
+	id := c.Param("id")
+	// Permission check: superadmin or MANAGE_POSTS
+	if !mw.IsSuper(c) {
+		uid, _ := c.Get(mw.CtxUserID)
+		var cnt int64
+		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_POSTS").Scan(&cnt)
+		if cnt == 0 {
+			basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "no permission")
+			return
+		}
+	}
+
+	var comment model.Comment
+	if err := h.db.First(&comment, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "comment not found")
+		return
+	}
+
+	if err := h.db.Model(&comment).Update("is_pinned", true).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "pin failed")
+		return
+	}
+
+	// Log operation
+	if uid, ok := c.Get(mw.CtxUserID); ok {
+		if uidStr, ok2 := uid.(string); ok2 {
+			service.LogOperation(h.db, uidStr, "pin_comment", "comment", id, nil)
+		}
+	}
+
+	basichttp.OK(c, gin.H{"id": id, "is_pinned": true})
+}
+
+// UnpinComment unpins a comment (MANAGE_POSTS or superadmin)
+// POST /api/admin/comments/:id/unpin
+func (h *CommentHandler) UnpinComment(c *gin.Context) {
+	id := c.Param("id")
+	// Permission check: superadmin or MANAGE_POSTS
+	if !mw.IsSuper(c) {
+		uid, _ := c.Get(mw.CtxUserID)
+		var cnt int64
+		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_POSTS").Scan(&cnt)
+		if cnt == 0 {
+			basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "no permission")
+			return
+		}
+	}
+
+	var comment model.Comment
+	if err := h.db.First(&comment, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "comment not found")
+		return
+	}
+
+	if err := h.db.Model(&comment).Update("is_pinned", false).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "unpin failed")
+		return
+	}
+
+	// Log operation
+	if uid, ok := c.Get(mw.CtxUserID); ok {
+		if uidStr, ok2 := uid.(string); ok2 {
+			service.LogOperation(h.db, uidStr, "unpin_comment", "comment", id, nil)
+		}
+	}
+
+	basichttp.OK(c, gin.H{"id": id, "is_pinned": false})
 }
 
 // GET /api/my/comments (auth)

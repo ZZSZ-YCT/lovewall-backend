@@ -118,6 +118,7 @@ func main() {
 	api.GET("/users/:id/online", onlineH.GetUserOnlineStatus)
 	api.GET("/posts", postH.ListPosts)
 	api.GET("/posts/:id", postH.GetPost)
+	api.GET("/posts/:id/lock-status", postH.GetPostLockStatus)
 	api.GET("/users/:id/posts", postH.ListByUser)
 	api.GET("/posts/:id/stats", postH.Stats)
 	api.GET("/posts/:id/comments", cmtH.ListForPost)
@@ -144,7 +145,8 @@ func main() {
 		postH.CreatePost,
 	)
 	authed.POST("/posts/:id/request-review", postH.RequestManualReview)
-	// Edit post endpoint removed per requirement (no editing)
+	// Edit post: author within 15min or MANAGE_POSTS
+	authed.PUT("/posts/:id", postH.Update)
 	authed.DELETE("/posts/:id", postH.Delete)
 	authed.POST("/posts/:id/pin", mw.RequirePerm(database, "MANAGE_FEATURED"), postH.Pin)
 	authed.POST("/posts/:id/feature", mw.RequirePerm(database, "MANAGE_FEATURED"), postH.Feature)
@@ -158,6 +160,8 @@ func main() {
 	authed.DELETE("/announcements/:id", mw.RequirePerm(database, "MANAGE_ANNOUNCEMENTS"), annH.Delete)
 	authed.POST("/admin/posts/:id/approve", adminH.ApprovePost)
 	authed.POST("/admin/posts/:id/reject", adminH.RejectPost)
+	authed.POST("/admin/posts/:id/lock", mw.RequirePerm(database, "MANAGE_POSTS"), postH.LockPost)
+	authed.POST("/admin/posts/:id/unlock", mw.RequirePerm(database, "MANAGE_POSTS"), postH.UnlockPost)
 
 	authed.GET("/users", mw.RequirePerm(database, "MANAGE_USERS"), adminH.ListUsers)
 	authed.PUT("/users/:id", authH.UpdateUser)
@@ -176,10 +180,13 @@ func main() {
 		cmtH.Create,
 	)
 	authed.DELETE("/comments/:id", cmtH.Delete)
-	// Edit comment endpoint removed per requirement (no editing)
-	authed.POST("/comments/:id/hide", mw.RequirePerm(database, "MANAGE_COMMENTS"), cmtH.Hide)
+	// Edit comment: author within 15min or MANAGE_POSTS
+	authed.PUT("/comments/:id", cmtH.Update)
+	authed.POST("/comments/:id/hide", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.Hide)
+	authed.POST("/comments/:id/pin", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.PinComment)
+	authed.POST("/comments/:id/unpin", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.UnpinComment)
 	authed.GET("/my/comments", cmtH.ListMine)
-	authed.GET("/comments", mw.RequirePerm(database, "MANAGE_COMMENTS"), cmtH.ListModeration)
+	authed.GET("/comments", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.ListModeration)
 
 	// Tag and Redemption Code APIs
 	authed.POST("/tags", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.CreateTag)

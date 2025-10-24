@@ -95,7 +95,15 @@ func AutoMigrate(db *gorm.DB) error {
 	}
 
 	// Auto-migrate permissions after schema migration
-	return MigratePermissions(db)
+	if err := MigratePermissions(db); err != nil {
+		return err
+	}
+
+	if err := migratePostCommentFeatures(db); err != nil {
+		return fmt.Errorf("migrate post/comment features: %w", err)
+	}
+
+	return nil
 }
 
 // MigrateCardType adds card_type column to posts table if it doesn't exist
@@ -316,5 +324,57 @@ func MigratePermissions(db *gorm.DB) error {
 	}
 
 	log.Printf("Permission migration completed: %d old permissions migrated\n", oldPermCount)
+	return nil
+}
+
+// migratePostCommentFeatures adds is_locked to posts and is_pinned to comments,
+// and merges MANAGE_COMMENTS permission into MANAGE_POSTS
+func migratePostCommentFeatures(db *gorm.DB) error {
+	// 1. Add is_locked column to posts if not exists
+	if !db.Migrator().HasColumn(&model.Post{}, "is_locked") {
+		if err := db.Migrator().AddColumn(&model.Post{}, "is_locked"); err != nil {
+			return fmt.Errorf("add is_locked column: %w", err)
+		}
+	}
+
+	// 2. Add is_pinned column to comments if not exists
+	if !db.Migrator().HasColumn(&model.Comment{}, "is_pinned") {
+		if err := db.Migrator().AddColumn(&model.Comment{}, "is_pinned"); err != nil {
+			return fmt.Errorf("add is_pinned column: %w", err)
+		}
+	}
+
+	// 3. Merge MANAGE_COMMENTS into MANAGE_POSTS
+	// Update all MANAGE_COMMENTS permissions to MANAGE_POSTS
+	if err := db.Exec(`
+		UPDATE user_permissions 
+		SET permission = 'MANAGE_POSTS' 
+		WHERE permission = 'MANAGE_COMMENTS' 
+		AND deleted_at IS NULL
+	`).Error; err != nil {
+		return fmt.Errorf("merge MANAGE_COMMENTS: %w", err)
+	}
+
+	// 4. Remove duplicate MANAGE_POSTS permissions for same user
+	// (in case user already had both permissions)
+	if err := db.Exec(`
+		DELETE FROM user_permissions 
+		WHERE id IN (
+			SELECT up.id FROM user_permissions up
+			INNER JOIN (
+				SELECT user_id, MIN(id) as keep_id
+				FROM user_permissions
+				WHERE permission = 'MANAGE_POSTS' AND deleted_at IS NULL
+				GROUP BY user_id
+				HAVING COUNT(*) > 1
+			) dup ON up.user_id = dup.user_id
+			WHERE up.permission = 'MANAGE_POSTS' 
+			AND up.deleted_at IS NULL
+			AND up.id != dup.keep_id
+		)
+	`).Error; err != nil {
+		return fmt.Errorf("remove duplicate permissions: %w", err)
+	}
+
 	return nil
 }

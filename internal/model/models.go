@@ -86,6 +86,7 @@ type Post struct {
 	Status     int     `gorm:"not null;default:0;index" json:"status"`
 	IsPinned   bool    `gorm:"not null;default:false;index" json:"is_pinned"`
 	IsFeatured bool    `gorm:"not null;default:false;index" json:"is_featured"`
+	IsLocked   bool    `gorm:"not null;default:false" json:"is_locked"`
 	// confessor_mode: "self" uses current user's display name; "custom" uses stored AuthorName
 	ConfessorMode *string `gorm:"not null;default:custom" json:"confessor_mode"`
 	CardType      *string `gorm:"not null;default:confession;index" json:"card_type"`
@@ -115,6 +116,7 @@ type Comment struct {
 	UserID   string  `gorm:"index;not null" json:"user_id"`
 	Content  string  `gorm:"not null" json:"content"`
 	Status   int     `gorm:"not null;default:0;index" json:"status"`
+	IsPinned bool    `gorm:"not null;default:false" json:"is_pinned"`
 	Metadata *string `json:"metadata,omitempty"`
 	// Moderation
 	AuditStatus int     `gorm:"not null;default:0" json:"audit_status"` // 0=approved,1=pending,2=rejected

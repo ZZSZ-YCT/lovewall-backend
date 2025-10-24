@@ -586,6 +586,34 @@ func (h *PostHandler) Feature(c *gin.Context) {
 	basichttp.OK(c, gin.H{"id": id, "is_featured": body.Feature})
 }
 
+func (h *PostHandler) LockPost(c *gin.Context) {
+	id := c.Param("id")
+	if err := h.db.Model(&model.Post{}).Where("id = ? AND deleted_at IS NULL", id).Update("is_locked", true).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
+		return
+	}
+	if uid, ok := c.Get(mw.CtxUserID); ok {
+		if uidStr, ok2 := uid.(string); ok2 {
+			service.LogOperation(h.db, uidStr, "lock_post", "post", id, nil)
+		}
+	}
+	basichttp.OK(c, gin.H{"id": id, "is_locked": true})
+}
+
+func (h *PostHandler) UnlockPost(c *gin.Context) {
+	id := c.Param("id")
+	if err := h.db.Model(&model.Post{}).Where("id = ? AND deleted_at IS NULL", id).Update("is_locked", false).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
+		return
+	}
+	if uid, ok := c.Get(mw.CtxUserID); ok {
+		if uidStr, ok2 := uid.(string); ok2 {
+			service.LogOperation(h.db, uidStr, "unlock_post", "post", id, nil)
+		}
+	}
+	basichttp.OK(c, gin.H{"id": id, "is_locked": false})
+}
+
 func (h *PostHandler) Hide(c *gin.Context) {
 	var body struct {
 		Hide   bool    `json:"hide"`
@@ -664,30 +692,13 @@ func (h *PostHandler) Update(c *gin.Context) {
 		return
 	}
 	uid, _ := c.Get(mw.CtxUserID)
-	canEdit := uid == p.AuthorID
-	if !canEdit {
-		// require perm MANAGE_POSTS or superadmin
-		if !mw.IsSuper(c) {
-			var cnt int64
-			h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id=? AND permission=? AND deleted_at IS NULL", uid, "MANAGE_POSTS").Scan(&cnt)
-			if cnt == 0 {
-				basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "no permission")
-				return
-			}
-		}
-		canEdit = true
-	} else {
-		// author limited time window
-		if time.Since(p.CreatedAt) > 15*time.Minute {
-			// need MANAGE_POSTS if beyond window
-			if !mw.IsSuper(c) {
-				var cnt int64
-				h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id=? AND permission=? AND deleted_at IS NULL", uid, "MANAGE_POSTS").Scan(&cnt)
-				if cnt == 0 {
-					basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "edit window closed")
-					return
-				}
-			}
+	// Only allow admins to edit posts, authors cannot edit
+	if !mw.IsSuper(c) {
+		var cnt int64
+		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id=? AND permission=? AND deleted_at IS NULL", uid, "MANAGE_POSTS").Scan(&cnt)
+		if cnt == 0 {
+			basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "only admin can edit posts")
+			return
 		}
 	}
 	var body updatePostBody
@@ -733,6 +744,18 @@ func (h *PostHandler) Update(c *gin.Context) {
 	} else {
 		basichttp.OK(c, gin.H{"ok": true})
 	}
+}
+
+// GetPostLockStatus returns lock status of a post
+// GET /api/posts/:id/lock-status (public)
+func (h *PostHandler) GetPostLockStatus(c *gin.Context) {
+	id := c.Param("id")
+	var post model.Post
+	if err := h.db.Select("id, is_locked").First(&post, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found")
+		return
+	}
+	basichttp.OK(c, gin.H{"id": id, "is_locked": post.IsLocked})
 }
 
 // Delete (soft): author or MANAGE_POSTS
