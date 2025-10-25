@@ -345,35 +345,30 @@ func migratePostCommentFeatures(db *gorm.DB) error {
 	}
 
 	// 3. Merge MANAGE_COMMENTS into MANAGE_POSTS
-	// Update all MANAGE_COMMENTS permissions to MANAGE_POSTS
+	// First, delete existing MANAGE_POSTS for users who also have MANAGE_COMMENTS
+	// This prevents UNIQUE constraint violation
 	if err := db.Exec(`
-		UPDATE user_permissions 
-		SET permission = 'MANAGE_POSTS' 
-		WHERE permission = 'MANAGE_COMMENTS' 
+		DELETE FROM user_permissions
+		WHERE permission = 'MANAGE_POSTS'
+		AND deleted_at IS NULL
+		AND user_id IN (
+			SELECT user_id
+			FROM user_permissions
+			WHERE permission = 'MANAGE_COMMENTS'
+			AND deleted_at IS NULL
+		)
+	`).Error; err != nil {
+		return fmt.Errorf("delete existing MANAGE_POSTS: %w", err)
+	}
+
+	// Then update all MANAGE_COMMENTS to MANAGE_POSTS
+	if err := db.Exec(`
+		UPDATE user_permissions
+		SET permission = 'MANAGE_POSTS'
+		WHERE permission = 'MANAGE_COMMENTS'
 		AND deleted_at IS NULL
 	`).Error; err != nil {
 		return fmt.Errorf("merge MANAGE_COMMENTS: %w", err)
-	}
-
-	// 4. Remove duplicate MANAGE_POSTS permissions for same user
-	// (in case user already had both permissions)
-	if err := db.Exec(`
-		DELETE FROM user_permissions 
-		WHERE id IN (
-			SELECT up.id FROM user_permissions up
-			INNER JOIN (
-				SELECT user_id, MIN(id) as keep_id
-				FROM user_permissions
-				WHERE permission = 'MANAGE_POSTS' AND deleted_at IS NULL
-				GROUP BY user_id
-				HAVING COUNT(*) > 1
-			) dup ON up.user_id = dup.user_id
-			WHERE up.permission = 'MANAGE_POSTS' 
-			AND up.deleted_at IS NULL
-			AND up.id != dup.keep_id
-		)
-	`).Error; err != nil {
-		return fmt.Errorf("remove duplicate permissions: %w", err)
 	}
 
 	return nil
