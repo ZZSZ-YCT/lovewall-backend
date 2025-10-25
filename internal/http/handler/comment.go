@@ -63,6 +63,7 @@ func (h *CommentHandler) enrichCommentWithUserTag(comment *model.Comment) gin.H 
 		"user_username":     nil,
 		"content":           comment.Content,
 		"status":            comment.Status,
+		"is_pinned":         comment.IsPinned,
 		"metadata":          comment.Metadata,
 		"created_at":        comment.CreatedAt,
 		"updated_at":        comment.UpdatedAt,

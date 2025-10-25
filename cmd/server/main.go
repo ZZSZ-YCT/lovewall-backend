@@ -162,6 +162,8 @@ func main() {
 	authed.POST("/admin/posts/:id/reject", adminH.RejectPost)
 	authed.POST("/admin/posts/:id/lock", mw.RequirePerm(database, "MANAGE_POSTS"), postH.LockPost)
 	authed.POST("/admin/posts/:id/unlock", mw.RequirePerm(database, "MANAGE_POSTS"), postH.UnlockPost)
+	authed.POST("/admin/comments/:id/pin", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.PinComment)
+	authed.POST("/admin/comments/:id/unpin", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.UnpinComment)
 
 	authed.GET("/users", mw.RequirePerm(database, "MANAGE_USERS"), adminH.ListUsers)
 	authed.PUT("/users/:id", authH.UpdateUser)
@@ -183,8 +185,6 @@ func main() {
 	// Edit comment: author within 15min or MANAGE_POSTS
 	authed.PUT("/comments/:id", cmtH.Update)
 	authed.POST("/comments/:id/hide", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.Hide)
-	authed.POST("/comments/:id/pin", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.PinComment)
-	authed.POST("/comments/:id/unpin", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.UnpinComment)
 	authed.GET("/my/comments", cmtH.ListMine)
 	authed.GET("/comments", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.ListModeration)
 

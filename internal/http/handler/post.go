@@ -316,6 +316,7 @@ func (h *PostHandler) enrichPostWithUserTag(post *model.Post) gin.H {
 		"status":                  post.Status,
 		"is_pinned":               post.IsPinned,
 		"is_featured":             post.IsFeatured,
+		"is_locked":               post.IsLocked,
 		"confessor_mode":          post.ConfessorMode,
 		"card_type":               cardType,
 		"metadata":                post.Metadata,
