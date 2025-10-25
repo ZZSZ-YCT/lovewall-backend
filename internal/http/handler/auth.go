@@ -534,33 +534,57 @@ func (h *AuthHandler) UpdateUser(c *gin.Context) {
 		updates["username"] = uname
 	}
 	if req.DisplayName != nil {
-		updates["display_name"] = req.DisplayName
+		if strings.TrimSpace(*req.DisplayName) == "" {
+			updates["display_name"] = nil
+		} else {
+			updates["display_name"] = req.DisplayName
+		}
 	}
 	if req.Email != nil {
-		// Check email uniqueness
-		var count int64
-		h.db.Model(&model.User{}).Where("email = ? AND id != ? AND deleted_at IS NULL", *req.Email, userID).Count(&count)
-		if count > 0 {
-			basichttp.Fail(c, http.StatusConflict, "CONFLICT", "email already exists")
-			return
+		email := strings.TrimSpace(*req.Email)
+		if email == "" {
+			// Allow clearing email
+			updates["email"] = nil
+		} else {
+			// Check email uniqueness
+			var count int64
+			h.db.Model(&model.User{}).Where("email = ? AND id != ? AND deleted_at IS NULL", email, userID).Count(&count)
+			if count > 0 {
+				basichttp.Fail(c, http.StatusConflict, "CONFLICT", "email already exists")
+				return
+			}
+			updates["email"] = &email
 		}
-		updates["email"] = req.Email
 	}
 	if req.Phone != nil {
-		// Check phone uniqueness
-		var count int64
-		h.db.Model(&model.User{}).Where("phone = ? AND id != ? AND deleted_at IS NULL", *req.Phone, userID).Count(&count)
-		if count > 0 {
-			basichttp.Fail(c, http.StatusConflict, "CONFLICT", "phone already exists")
-			return
+		phone := strings.TrimSpace(*req.Phone)
+		if phone == "" {
+			// Allow clearing phone
+			updates["phone"] = nil
+		} else {
+			// Check phone uniqueness
+			var count int64
+			h.db.Model(&model.User{}).Where("phone = ? AND id != ? AND deleted_at IS NULL", phone, userID).Count(&count)
+			if count > 0 {
+				basichttp.Fail(c, http.StatusConflict, "CONFLICT", "phone already exists")
+				return
+			}
+			updates["phone"] = &phone
 		}
-		updates["phone"] = req.Phone
 	}
 	if req.AvatarURL != nil {
-		updates["avatar_url"] = req.AvatarURL
+		if strings.TrimSpace(*req.AvatarURL) == "" {
+			updates["avatar_url"] = nil
+		} else {
+			updates["avatar_url"] = req.AvatarURL
+		}
 	}
 	if req.Bio != nil {
-		updates["bio"] = req.Bio
+		if strings.TrimSpace(*req.Bio) == "" {
+			updates["bio"] = nil
+		} else {
+			updates["bio"] = req.Bio
+		}
 	}
 
 	// Handle avatar base64 upload (admin/self)
