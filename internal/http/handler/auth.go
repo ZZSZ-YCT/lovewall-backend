@@ -434,6 +434,18 @@ func sanitizeUserPublic(db *gorm.DB, u *model.User) gin.H {
 	}
 }
 
+func sanitizeUserPublicList(u *model.User) gin.H {
+	var displayName any
+	if u.DisplayName != nil {
+		displayName = *u.DisplayName
+	}
+	return gin.H{
+		"id":           u.ID,
+		"username":     u.Username,
+		"display_name": displayName,
+	}
+}
+
 type UpdateUserRequest struct {
 	Username     *string `json:"username"`
 	DisplayName  *string `json:"display_name"`
@@ -925,6 +937,57 @@ func (h *AuthHandler) GetUserPublicByUsername(c *gin.Context) {
 		return
 	}
 	basichttp.OK(c, sanitizeUserPublic(h.db, &u))
+}
+
+// GET /api/users (public)
+func (h *AuthHandler) UserList(c *gin.Context) {
+	q := strings.TrimSpace(c.Query("q"))
+
+	page := 1
+	if v := strings.TrimSpace(c.Query("page")); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+
+	size := 20
+	if v := strings.TrimSpace(c.Query("page_size")); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			size = parsed
+		}
+	}
+	if size <= 0 {
+		size = 20
+	}
+	if size > 50 {
+		size = 50
+	}
+
+	offset := (page - 1) * size
+	if offset < 0 {
+		offset = 0
+	}
+
+	var users []model.User
+	query := h.db.Model(&model.User{}).
+		Select("id, username, display_name").
+		Where("deleted_at IS NULL").
+		Order("username ASC")
+	if q != "" {
+		pattern := "%" + q + "%"
+		query = query.Where("(username LIKE ? OR COALESCE(display_name, '') LIKE ?)", pattern, pattern)
+	}
+	if err := query.Offset(offset).Limit(size).Find(&users).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+		return
+	}
+
+	result := make([]gin.H, 0, len(users))
+	for i := range users {
+		result = append(result, sanitizeUserPublicList(&users[i]))
+	}
+
+	basichttp.OK(c, gin.H{"users": result})
 }
 
 // GET /api/users/:id/status (public)
