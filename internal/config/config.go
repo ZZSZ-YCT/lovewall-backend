@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"os"
 	"strconv"
+	"strings"
+	"time"
 )
 
 type Config struct {
@@ -42,6 +44,19 @@ type Config struct {
 	// Geetest captcha
 	GeetestCaptchaID  string // Geetest public key (captcha_id)
 	GeetestCaptchaKey string // Geetest private key (captcha_key)
+	// Cache / Redis
+	RedisEnabled           bool
+	RedisAddr              string
+	RedisPassword          string
+	RedisDB                int
+	RedisUseTLS            bool
+	RedisDialTimeout       time.Duration
+	RedisReadTimeout       time.Duration
+	RedisWriteTimeout      time.Duration
+	CacheMaxEntries        int
+	CacheUserTTL           time.Duration
+	CacheUserListTTL       time.Duration
+	CachePerfWarnThreshold time.Duration
 }
 
 func getenv(key, def string) string {
@@ -69,6 +84,24 @@ func getint64(key string, def int64) int64 {
 	return def
 }
 
+func getbool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(strings.ToLower(v)); err == nil {
+			return b
+		}
+	}
+	return def
+}
+
+func getdurationMS(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return def
+}
+
 func generateJWTSecret() string {
 	bytes := make([]byte, 32)
 	if _, err := rand.Read(bytes); err != nil {
@@ -90,6 +123,31 @@ func Load() *Config {
 		if err := os.MkdirAll(uploadDir, 0755); err != nil {
 			panic("failed to create upload directory " + uploadDir + ": " + err.Error())
 		}
+	}
+
+	redisDialTimeout := getdurationMS("REDIS_DIAL_TIMEOUT_MS", 1500*time.Millisecond)
+	if redisDialTimeout <= 0 {
+		redisDialTimeout = 1500 * time.Millisecond
+	}
+	redisReadTimeout := getdurationMS("REDIS_READ_TIMEOUT_MS", 800*time.Millisecond)
+	if redisReadTimeout <= 0 {
+		redisReadTimeout = 800 * time.Millisecond
+	}
+	redisWriteTimeout := getdurationMS("REDIS_WRITE_TIMEOUT_MS", 800*time.Millisecond)
+	if redisWriteTimeout <= 0 {
+		redisWriteTimeout = 800 * time.Millisecond
+	}
+	cacheUserTTL := getdurationMS("CACHE_USER_TTL_MS", 30*time.Minute)
+	if cacheUserTTL <= 0 {
+		cacheUserTTL = 30 * time.Minute
+	}
+	cacheUserListTTL := getdurationMS("CACHE_USER_LIST_TTL_MS", 5*time.Minute)
+	if cacheUserListTTL <= 0 {
+		cacheUserListTTL = 5 * time.Minute
+	}
+	cachePerfWarn := getdurationMS("CACHE_PERF_WARN_MS", 200*time.Millisecond)
+	if cachePerfWarn <= 0 {
+		cachePerfWarn = 200 * time.Millisecond
 	}
 
 	return &Config{
@@ -124,5 +182,17 @@ func Load() *Config {
 		MaxCommentChars:             getinti("MAX_COMMENT_CHARS", 500),
 		GeetestCaptchaID:            getenv("GEETEST_CAPTCHA_ID", ""),
 		GeetestCaptchaKey:           getenv("GEETEST_CAPTCHA_KEY", ""),
+		RedisEnabled:                getbool("REDIS_ENABLED", false),
+		RedisAddr:                   getenv("REDIS_ADDR", "127.0.0.1:6379"),
+		RedisPassword:               getenv("REDIS_PASSWORD", ""),
+		RedisDB:                     getinti("REDIS_DB", 0),
+		RedisUseTLS:                 getbool("REDIS_USE_TLS", false),
+		RedisDialTimeout:            redisDialTimeout,
+		RedisReadTimeout:            redisReadTimeout,
+		RedisWriteTimeout:           redisWriteTimeout,
+		CacheMaxEntries:             getinti("CACHE_MAX_ENTRIES", 2048),
+		CacheUserTTL:                cacheUserTTL,
+		CacheUserListTTL:            cacheUserListTTL,
+		CachePerfWarnThreshold:      cachePerfWarn,
 	}
 }

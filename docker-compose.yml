@@ -1,4 +1,31 @@
+version: '3.8'
+
 services:
+  # Redis缓存服务（仅内部网络访问）
+  redis:
+    image: redis:7-alpine
+    container_name: lovewall-redis
+    restart: unless-stopped
+    # 不暴露端口到宿主机，仅容器间通信
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - lovewall-network
+
+  # 主应用服务
   love-wall:
     build: .
     image: lovewall:latest
@@ -7,6 +34,36 @@ services:
       - "8124:8000"
     env_file:
       - .env
+    environment:
+      # Redis配置（直接在docker-compose中配置）
+      REDIS_ENABLED: "true"
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: 0
+      REDIS_USE_TLS: "false"
+      # 缓存配置
+      CACHE_MAX_ENTRIES: 2048
+      CACHE_USER_TTL_MS: 1800000
+      CACHE_USER_LIST_TTL_MS: 300000
+      CACHE_PERF_WARN_MS: 200
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8000/api/users"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - lovewall-network
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  lovewall-network:
+    driver: bridge

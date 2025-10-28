@@ -2,7 +2,11 @@ package handler
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha1"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -11,9 +15,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 
@@ -27,12 +34,13 @@ import (
 )
 
 type AuthHandler struct {
-	db  *gorm.DB
-	cfg *config.Config
+	db    *gorm.DB
+	cfg   *config.Config
+	cache service.Cache
 }
 
-func NewAuthHandler(db *gorm.DB, cfg *config.Config) *AuthHandler {
-	return &AuthHandler{db: db, cfg: cfg}
+func NewAuthHandler(db *gorm.DB, cfg *config.Config, cache service.Cache) *AuthHandler {
+	return &AuthHandler{db: db, cfg: cfg, cache: cache}
 }
 
 type RegisterRequest struct {
@@ -489,6 +497,7 @@ func (h *AuthHandler) UpdateUser(c *gin.Context) {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
 		return
 	}
+	previousUsername := user.Username
 
 	// Prevent non-superadmin from modifying superadmin accounts
 	if user.IsSuperadmin && !isSelf {
@@ -687,6 +696,11 @@ func (h *AuthHandler) UpdateUser(c *gin.Context) {
 	if oldAvatarPathToDelete != "" {
 		_ = os.Remove(oldAvatarPathToDelete)
 	}
+
+	ctxReq := c.Request.Context()
+	publicPayload := sanitizeUserPublic(h.db, &user)
+	h.invalidateUserCache(ctxReq, user.ID, previousUsername, user.Username)
+	h.cacheUserPublic(ctxReq, &user, publicPayload)
 
 	// Log admin operation if editing others or changing username as admin
 	if !isSelf && hasManageUsers {
@@ -895,6 +909,10 @@ func (h *AuthHandler) UpdateProfile(c *gin.Context) {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "reload failed")
 		return
 	}
+	ctxReq := c.Request.Context()
+	publicPayload := sanitizeUserPublic(h.db, &user)
+	h.invalidateUserCache(ctxReq, user.ID, user.Username)
+	h.cacheUserPublic(ctxReq, &user, publicPayload)
 	// Best-effort delete of previous avatar
 	if oldAvatarPathToDelete != "" {
 		_ = os.Remove(oldAvatarPathToDelete)
@@ -920,74 +938,364 @@ func (h *AuthHandler) GetUserPublicByID(c *gin.Context) {
 		return
 	}
 
+	ctx := c.Request.Context()
+	var cached map[string]any
+	if ok, err := h.readJSONFromCache(ctx, userCacheKeyByID(id), &cached); err == nil && ok {
+		basichttp.OK(c, cached)
+		return
+	} else if err != nil {
+		zap.L().Warn("failed to read user cache by id", zap.Error(err))
+	}
+
 	var u model.User
 	if err := h.db.Unscoped().First(&u, "id = ?", id).Error; err != nil {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
 		return
 	}
-	basichttp.OK(c, sanitizeUserPublic(h.db, &u))
+	payload := sanitizeUserPublic(h.db, &u)
+	basichttp.OK(c, payload)
+	h.cacheUserPublic(ctx, &u, payload)
 }
 
 // GET /api/users/by-username/:username (public)
 func (h *AuthHandler) GetUserPublicByUsername(c *gin.Context) {
 	uname := c.Param("username")
+
+	ctx := c.Request.Context()
+	var cached map[string]any
+	if ok, err := h.readJSONFromCache(ctx, userCacheKeyByUsername(uname), &cached); err == nil && ok {
+		basichttp.OK(c, cached)
+		return
+	} else if err != nil {
+		zap.L().Warn("failed to read user cache by username", zap.Error(err))
+	}
+
 	var u model.User
 	if err := h.db.Unscoped().First(&u, "username = ?", uname).Error; err != nil {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
 		return
 	}
-	basichttp.OK(c, sanitizeUserPublic(h.db, &u))
+	payload := sanitizeUserPublic(h.db, &u)
+	basichttp.OK(c, payload)
+	h.cacheUserPublic(ctx, &u, payload)
+}
+
+const (
+	userListDefaultPage          = 1
+	userListDefaultPageSize      = 20
+	userListMaxPageSize          = 200
+	userListMaxPageNumber        = 5000
+	userListMaxQueryLength       = 500
+	userListQueryTimeout         = 1500 * time.Millisecond
+	userListSlowQueryThreshold   = 500 * time.Millisecond
+	userListCacheableMaxPageSize = 50
+	userListCacheVersion         = "v1"
+)
+
+var (
+	userListLikeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+)
+
+type userListPagination struct {
+	Page      int
+	Size      int
+	Offset    int
+	Limit     int
+	sanitized bool
+}
+
+func (p userListPagination) isDefault() bool {
+	return p.Page == userListDefaultPage && p.Size == userListDefaultPageSize
 }
 
 // GET /api/users (public)
 func (h *AuthHandler) UserList(c *gin.Context) {
-	q := strings.TrimSpace(c.Query("q"))
+	queryRaw := c.Query("q")
+	sanitizedQuery, hasFilter, queryAdjusted := normalizeUserListQuery(queryRaw)
+	pagination := parseUserListPagination(c.Query("page"), c.Query("page_size"))
 
-	page := 1
-	if v := strings.TrimSpace(c.Query("page")); v != "" {
-		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
-			page = parsed
+	if queryAdjusted {
+		zap.L().Debug("user list query normalized", zap.Int("original_runes", utf8.RuneCountInString(queryRaw)))
+	}
+	if pagination.sanitized {
+		zap.L().Debug("user list pagination normalized", zap.Int("page", pagination.Page), zap.Int("size", pagination.Size))
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), userListQueryTimeout)
+	defer cancel()
+
+	shouldCache := h.cache != nil && !hasFilter && pagination.Page == userListDefaultPage && pagination.Size <= userListCacheableMaxPageSize
+	cacheKey := ""
+	if shouldCache {
+		cacheKey = buildUserListCacheKey(sanitizedQuery, pagination.Page, pagination.Size)
+		var cached struct {
+			Users []map[string]any `json:"users"`
 		}
-	}
-
-	size := 20
-	if v := strings.TrimSpace(c.Query("page_size")); v != "" {
-		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
-			size = parsed
+		ok, err := h.readJSONFromCache(ctx, cacheKey, &cached)
+		if err != nil {
+			zap.L().Warn("failed to read user list cache", zap.Error(err))
+		} else if ok {
+			basichttp.OK(c, gin.H{"users": cached.Users})
+			return
 		}
-	}
-	if size <= 0 {
-		size = 20
-	}
-	if size > 50 {
-		size = 50
-	}
-
-	offset := (page - 1) * size
-	if offset < 0 {
-		offset = 0
 	}
 
 	var users []model.User
-	query := h.db.Model(&model.User{}).
+	query := h.db.WithContext(ctx).Model(&model.User{}).
 		Select("id, username, display_name").
 		Where("deleted_at IS NULL").
 		Order("username ASC")
-	if q != "" {
-		pattern := "%" + q + "%"
-		query = query.Where("(username LIKE ? OR COALESCE(display_name, '') LIKE ?)", pattern, pattern)
+	if hasFilter {
+		pattern := "%" + sanitizedQuery + "%"
+		query = query.Where("(username LIKE ? ESCAPE '\\' OR (display_name IS NOT NULL AND display_name LIKE ? ESCAPE '\\'))", pattern, pattern)
 	}
-	if err := query.Offset(offset).Limit(size).Find(&users).Error; err != nil {
+
+	start := time.Now()
+	if err := query.Offset(pagination.Offset).Limit(pagination.Limit).Find(&users).Error; err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			basichttp.Fail(c, http.StatusGatewayTimeout, "TIMEOUT", "query timeout exceeded")
+			return
+		}
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
 		return
 	}
+	duration := time.Since(start)
 
-	result := make([]gin.H, 0, len(users))
+	result := make([]gin.H, len(users))
 	for i := range users {
-		result = append(result, sanitizeUserPublicList(&users[i]))
+		result[i] = sanitizeUserPublicList(&users[i])
+	}
+
+	if shouldCache {
+		payload := struct {
+			Users []gin.H `json:"users"`
+		}{Users: result}
+		if err := h.writeJSONToCache(ctx, cacheKey, payload, h.userListCacheTTL()); err != nil {
+			zap.L().Debug("user list cache store failed", zap.Error(err))
+		}
+	}
+
+	if duration >= userListSlowQueryThreshold {
+		zap.L().Info("user list query slow", zap.Duration("duration", duration), zap.Int("count", len(result)), zap.Bool("filter", hasFilter))
 	}
 
 	basichttp.OK(c, gin.H{"users": result})
+}
+
+func parseUserListPagination(pageRaw, sizeRaw string) userListPagination {
+	page := userListDefaultPage
+	size := userListDefaultPageSize
+	sanitized := false
+
+	if pageRaw = strings.TrimSpace(pageRaw); pageRaw != "" {
+		if parsed, err := strconv.Atoi(pageRaw); err == nil && parsed > 0 {
+			if parsed > userListMaxPageNumber {
+				page = userListMaxPageNumber
+				sanitized = true
+			} else {
+				page = parsed
+			}
+		} else {
+			sanitized = true
+		}
+	}
+
+	if sizeRaw = strings.TrimSpace(sizeRaw); sizeRaw != "" {
+		if parsed, err := strconv.Atoi(sizeRaw); err == nil && parsed > 0 {
+			if parsed > userListMaxPageSize {
+				size = userListMaxPageSize
+				sanitized = true
+			} else {
+				size = parsed
+			}
+		} else {
+			sanitized = true
+		}
+	}
+
+	offset := (page - 1) * size
+
+	return userListPagination{
+		Page:      page,
+		Size:      size,
+		Offset:    offset,
+		Limit:     size,
+		sanitized: sanitized,
+	}
+}
+
+func normalizeUserListQuery(raw string) (string, bool, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", false, false
+	}
+
+	runes := []rune(trimmed)
+	changed := false
+	if len(runes) > userListMaxQueryLength {
+		runes = runes[:userListMaxQueryLength]
+		changed = true
+	}
+
+	filtered := make([]rune, 0, len(runes))
+	for _, r := range runes {
+		if unicode.IsControl(r) {
+			changed = true
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+
+	if len(filtered) == 0 {
+		return "", false, true
+	}
+
+	sanitized := userListLikeEscaper.Replace(string(filtered))
+	if sanitized != string(filtered) {
+		changed = true
+	}
+
+	return sanitized, true, changed
+}
+
+func (h *AuthHandler) readJSONFromCache(ctx context.Context, key string, dest any) (bool, error) {
+	if h.cache == nil || key == "" {
+		return false, nil
+	}
+	payload, ok, err := h.cache.Get(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	if err := json.Unmarshal(payload, dest); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (h *AuthHandler) writeJSONToCache(ctx context.Context, key string, value any, ttl time.Duration) error {
+	if h.cache == nil || key == "" || ttl <= 0 {
+		return nil
+	}
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return h.cache.Set(ctx, key, payload, ttl)
+}
+
+func (h *AuthHandler) cacheUserPublic(ctx context.Context, user *model.User, payload gin.H) {
+	if h.cache == nil || user == nil {
+		return
+	}
+	ttl := h.userCacheTTL()
+	if ttl <= 0 {
+		return
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		zap.L().Warn("marshal user cache payload failed", zap.Error(err))
+		return
+	}
+	keys := []string{userCacheKeyByID(user.ID)}
+	if user.Username != "" {
+		keys = append(keys, userCacheKeyByUsername(user.Username))
+	}
+	for _, key := range keys {
+		if err := h.cache.Set(ctx, key, data, ttl); err != nil {
+			zap.L().Debug("user cache set failed", zap.Error(err))
+		}
+	}
+}
+
+func (h *AuthHandler) invalidateUserCache(ctx context.Context, id string, usernames ...string) {
+	invalidateUserCaches(ctx, h.cache, id, usernames...)
+}
+
+func (h *AuthHandler) invalidateUserListCache(ctx context.Context) {
+	invalidateUserListCaches(ctx, h.cache)
+}
+
+func (h *AuthHandler) userCacheTTL() time.Duration {
+	if ttl := h.cfg.CacheUserTTL; ttl > 0 {
+		return ttl
+	}
+	return 30 * time.Minute
+}
+
+func (h *AuthHandler) userListCacheTTL() time.Duration {
+	if ttl := h.cfg.CacheUserListTTL; ttl > 0 {
+		return ttl
+	}
+	return 5 * time.Minute
+}
+
+func invalidateUserCaches(ctx context.Context, cache service.Cache, id string, usernames ...string) {
+	if cache == nil {
+		return
+	}
+	keySet := make(map[string]struct{})
+	if id != "" {
+		keySet[userCacheKeyByID(id)] = struct{}{}
+	}
+	for _, uname := range usernames {
+		normalized := strings.TrimSpace(uname)
+		if normalized == "" {
+			continue
+		}
+		keySet[userCacheKeyByUsername(normalized)] = struct{}{}
+	}
+	if len(keySet) > 0 {
+		keys := make([]string, 0, len(keySet))
+		for k := range keySet {
+			keys = append(keys, k)
+		}
+		if err := cache.Delete(ctx, keys...); err != nil {
+			zap.L().Debug("user cache invalidation failed", zap.Error(err))
+		}
+	}
+	invalidateUserListCaches(ctx, cache)
+}
+
+func invalidateUserListCaches(ctx context.Context, cache service.Cache) {
+	if cache == nil {
+		return
+	}
+	sizeSet := map[int]struct{}{
+		userListDefaultPageSize:      {},
+		userListCacheableMaxPageSize: {},
+	}
+	keys := make([]string, 0, len(sizeSet))
+	for size := range sizeSet {
+		keys = append(keys, buildUserListCacheKey("", userListDefaultPage, size))
+	}
+	if err := cache.Delete(ctx, keys...); err != nil {
+		zap.L().Debug("user list cache invalidation failed", zap.Error(err))
+	}
+}
+
+func userCacheKeyByID(id string) string {
+	return "user:public:v1:id:" + id
+}
+
+func userCacheKeyByUsername(username string) string {
+	normalized := strings.ToLower(strings.TrimSpace(username))
+	sum := sha1.Sum([]byte("uname::" + normalized))
+	return "user:public:v1:uname:" + hex.EncodeToString(sum[:])
+}
+
+func buildUserListCacheKey(query string, page, size int) string {
+	normalized := strings.ToLower(query)
+	base := strings.Join([]string{
+		userListCacheVersion,
+		strconv.Itoa(page),
+		strconv.Itoa(size),
+		normalized,
+	}, ":")
+	sum := sha1.Sum([]byte(base))
+	return "user:list:" + hex.EncodeToString(sum[:])
 }
 
 // GET /api/users/:id/status (public)

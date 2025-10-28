@@ -39,6 +39,8 @@ func main() {
 	// Cleanup orphaned tag relations to avoid frontend showing ghost "标签"
 	service.CleanupOrphanedTagRelations(database)
 
+	cacheSvc := service.NewCacheManager(cfg)
+
 	// Start moderation worker (async AI review)
 	service.StartModerationWorker(database, service.NewConfigAdapter(cfg.AIBaseURL, cfg.AIAPIKey, cfg.AIModel))
 
@@ -93,11 +95,11 @@ func main() {
 
 	api := r.Group("/api")
 
-	authH := handler.NewAuthHandler(database, cfg)
+	authH := handler.NewAuthHandler(database, cfg, cacheSvc)
 	postH := handler.NewPostHandler(database, cfg)
 	annH := handler.NewAnnouncementHandler(database, cfg)
 	cmtH := handler.NewCommentHandler(database, cfg)
-	adminH := handler.NewAdminHandler(database, cfg)
+	adminH := handler.NewAdminHandler(database, cfg, cacheSvc)
 	tagH := handler.NewTagHandler(database, cfg)
 	logH := handler.NewLogHandler(database, cfg)
 	notifyH := handler.NewNotifyHandler(database, cfg)

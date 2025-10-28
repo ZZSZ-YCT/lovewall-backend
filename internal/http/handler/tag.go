@@ -2,7 +2,9 @@ package handler
 
 import (
 	"net/http"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -18,6 +20,8 @@ type TagHandler struct {
 	db  *gorm.DB
 	cfg *config.Config
 }
+
+const tagTitleMaxWeight = 12
 
 func NewTagHandler(db *gorm.DB, cfg *config.Config) *TagHandler {
 	return &TagHandler{db: db, cfg: cfg}
@@ -37,6 +41,17 @@ func (h *TagHandler) CreateTag(c *gin.Context) {
 	var req CreateTagRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid request")
+		return
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	req.Title = strings.TrimSpace(req.Title)
+	if req.Name == "" || req.Title == "" {
+		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "name and title are required")
+		return
+	}
+	if !validateTagTitle(req.Title) {
+		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "title must be within 6 Chinese characters or 12 English letters")
 		return
 	}
 
@@ -138,7 +153,16 @@ func (h *TagHandler) UpdateTag(c *gin.Context) {
 
 	updates := make(map[string]interface{})
 	if req.Title != nil {
-		updates["title"] = *req.Title
+		title := strings.TrimSpace(*req.Title)
+		if title == "" {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "title cannot be empty")
+			return
+		}
+		if !validateTagTitle(title) {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "title must be within 6 Chinese characters or 12 English letters")
+			return
+		}
+		updates["title"] = title
 	}
 	if req.BackgroundColor != nil {
 		updates["background_color"] = *req.BackgroundColor
@@ -807,4 +831,24 @@ func (h *TagHandler) DeleteRedemptionCodes(c *gin.Context) {
 		}
 	}
 	basichttp.OK(c, gin.H{"deleted": deleted, "skipped": skipped})
+}
+func validateTagTitle(title string) bool {
+	trimmed := strings.TrimSpace(title)
+	if trimmed == "" {
+		return false
+	}
+	weight := 0
+	for _, r := range trimmed {
+		if unicode.Is(unicode.Han, r) {
+			weight += 2
+		} else if r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' {
+			weight++
+		} else {
+			return false
+		}
+		if weight > tagTitleMaxWeight {
+			return false
+		}
+	}
+	return true
 }

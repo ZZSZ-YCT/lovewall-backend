@@ -103,6 +103,10 @@ func AutoMigrate(db *gorm.DB) error {
 		return fmt.Errorf("migrate post/comment features: %w", err)
 	}
 
+	if err := ensurePerformanceIndexes(db); err != nil {
+		return fmt.Errorf("ensure performance indexes: %w", err)
+	}
+
 	return nil
 }
 
@@ -324,6 +328,23 @@ func MigratePermissions(db *gorm.DB) error {
 	}
 
 	log.Printf("Permission migration completed: %d old permissions migrated\n", oldPermCount)
+	return nil
+}
+
+func ensurePerformanceIndexes(db *gorm.DB) error {
+	statements := []string{
+		"CREATE INDEX IF NOT EXISTS idx_users_username_active ON users(username) WHERE deleted_at IS NULL",
+		"CREATE INDEX IF NOT EXISTS idx_users_display_name_active ON users(display_name) WHERE display_name IS NOT NULL AND deleted_at IS NULL",
+		"CREATE INDEX IF NOT EXISTS idx_users_is_banned ON users(is_banned, deleted_at)",
+		"CREATE INDEX IF NOT EXISTS idx_tags_title_active ON tags(title) WHERE deleted_at IS NULL",
+		"CREATE INDEX IF NOT EXISTS idx_tags_is_active ON tags(is_active, deleted_at)",
+	}
+
+	for _, stmt := range statements {
+		if err := db.Exec(stmt).Error; err != nil {
+			return fmt.Errorf("create index %s: %w", stmt, err)
+		}
+	}
 	return nil
 }
 

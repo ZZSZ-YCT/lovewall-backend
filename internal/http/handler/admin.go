@@ -19,12 +19,13 @@ import (
 )
 
 type AdminHandler struct {
-	db  *gorm.DB
-	cfg *config.Config
+	db    *gorm.DB
+	cfg   *config.Config
+	cache service.Cache
 }
 
-func NewAdminHandler(db *gorm.DB, cfg *config.Config) *AdminHandler {
-	return &AdminHandler{db: db, cfg: cfg}
+func NewAdminHandler(db *gorm.DB, cfg *config.Config, cache service.Cache) *AdminHandler {
+	return &AdminHandler{db: db, cfg: cfg, cache: cache}
 }
 
 // Only superadmin can overwrite permissions
@@ -94,6 +95,7 @@ func (h *AdminHandler) SetUserPermissions(c *gin.Context) {
 			service.LogOperation(h.db, uidStr, "set_user_permissions", "user", id, map[string]any{"permissions": perms})
 		}
 	}
+	invalidateUserCaches(c.Request.Context(), h.cache, id, user.Username)
 	basichttp.OK(c, gin.H{"user_id": id, "permissions": perms})
 }
 
@@ -255,6 +257,7 @@ func (h *AdminHandler) BanUser(c *gin.Context) {
 			service.LogOperation(h.db, uidStr, "ban_user", "user", id, map[string]any{"reason": body.Reason})
 		}
 	}
+	invalidateUserCaches(c.Request.Context(), h.cache, id, user.Username)
 	basichttp.OK(c, gin.H{"id": id, "is_banned": true, "ban_reason": body.Reason})
 }
 
@@ -293,6 +296,7 @@ func (h *AdminHandler) UnbanUser(c *gin.Context) {
 			service.LogOperation(h.db, uidStr, "unban_user", "user", id, nil)
 		}
 	}
+	invalidateUserCaches(c.Request.Context(), h.cache, id, user.Username)
 	basichttp.OK(c, gin.H{"id": id, "is_banned": false})
 }
 
@@ -330,6 +334,7 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 			service.LogOperation(h.db, uidStr, "delete_user", "user", id, nil)
 		}
 	}
+	invalidateUserCaches(c.Request.Context(), h.cache, id, user.Username)
 	basichttp.OK(c, gin.H{"id": id, "deleted": true, "is_deleted": true})
 }
 
