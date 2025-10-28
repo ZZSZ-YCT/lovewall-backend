@@ -169,7 +169,7 @@ type UserTag struct {
 	UserID     string    `gorm:"index:uniq_user_tag,unique;not null" json:"user_id"`
 	TagID      string    `gorm:"index:uniq_user_tag,unique;not null" json:"tag_id"`
 	ObtainedAt time.Time `gorm:"not null;default:current_timestamp" json:"obtained_at"`
-	IsActive   bool      `gorm:"not null;default:true;index" json:"is_active"`
+	IsActive   bool      `gorm:"not null;default:false;index" json:"is_active"`
 
 	// Relations
 	User User `gorm:"foreignKey:UserID;references:ID" json:"user,omitempty"`

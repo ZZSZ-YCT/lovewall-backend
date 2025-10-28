@@ -357,21 +357,42 @@ func (h *TagHandler) AssignUserTagToUser(c *gin.Context) {
 		return
 	}
 
+	// Use transaction to ensure atomicity
+	tx := h.db.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
 	// Check if user already has this tag
 	var existing model.UserTag
-	err := h.db.First(&existing, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, tagID).Error
+	err := tx.First(&existing, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, tagID).Error
 	if err == nil {
-		// Already has tag; optionally update active flag
+		// Already has tag; update active flag based on body.Active
 		if body.Active {
 			// Deactivate others and activate this one
-			if err := h.db.Model(&model.UserTag{}).Where("user_id = ? AND deleted_at IS NULL", userID).Update("is_active", false).Error; err != nil {
+			if err := tx.Model(&model.UserTag{}).Where("user_id = ? AND deleted_at IS NULL", userID).Update("is_active", false).Error; err != nil {
+				tx.Rollback()
 				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
 				return
 			}
-			if err := h.db.Model(&existing).Update("is_active", true).Error; err != nil {
+			if err := tx.Model(&existing).Update("is_active", true).Error; err != nil {
+				tx.Rollback()
 				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
 				return
 			}
+		} else {
+			// Ensure this tag is not active when body.Active is false
+			if err := tx.Model(&existing).Update("is_active", false).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
+				return
+			}
+		}
+		if err := tx.Commit().Error; err != nil {
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+			return
 		}
 		h.db.Preload("Tag").First(&existing, "id = ?", existing.ID)
 		if uid, ok := c.Get(mw.CtxUserID); ok {
@@ -392,14 +413,21 @@ func (h *TagHandler) AssignUserTagToUser(c *gin.Context) {
 	}
 	if body.Active {
 		// Deactivate others and mark this active
-		if err := h.db.Model(&model.UserTag{}).Where("user_id = ? AND deleted_at IS NULL", userID).Update("is_active", false).Error; err != nil {
+		if err := tx.Model(&model.UserTag{}).Where("user_id = ? AND deleted_at IS NULL", userID).Update("is_active", false).Error; err != nil {
+			tx.Rollback()
 			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
 			return
 		}
 		ut.IsActive = true
 	}
-	if err := h.db.Create(&ut).Error; err != nil {
+	// Use Select to explicitly set is_active field, even if it's false (zero value)
+	if err := tx.Select("ID", "CreatedAt", "UpdatedAt", "UserID", "TagID", "ObtainedAt", "IsActive").Create(&ut).Error; err != nil {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "create failed")
+		return
+	}
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
 		return
 	}
 	h.db.Preload("Tag").First(&ut, "id = ?", ut.ID)

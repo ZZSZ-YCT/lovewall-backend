@@ -780,7 +780,11 @@ func (h *AuthHandler) UpdateProfile(c *gin.Context) {
 	}
 
 	if req.DisplayName != nil {
-		updates["display_name"] = req.DisplayName
+		if strings.TrimSpace(*req.DisplayName) == "" {
+			updates["display_name"] = nil
+		} else {
+			updates["display_name"] = req.DisplayName
+		}
 	}
 	if req.Bio != nil {
 		if strings.TrimSpace(*req.Bio) == "" {

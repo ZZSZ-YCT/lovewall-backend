@@ -371,5 +371,52 @@ func migratePostCommentFeatures(db *gorm.DB) error {
 		return fmt.Errorf("merge MANAGE_COMMENTS: %w", err)
 	}
 
+	// 4. Clean up empty string values in nullable fields
+	// Convert empty strings to NULL for proper nullable field handling
+	if err := db.Exec(`
+		UPDATE users
+		SET display_name = NULL
+		WHERE display_name = ''
+		AND deleted_at IS NULL
+	`).Error; err != nil {
+		return fmt.Errorf("clean display_name: %w", err)
+	}
+
+	if err := db.Exec(`
+		UPDATE users
+		SET email = NULL
+		WHERE email = ''
+		AND deleted_at IS NULL
+	`).Error; err != nil {
+		return fmt.Errorf("clean email: %w", err)
+	}
+
+	if err := db.Exec(`
+		UPDATE users
+		SET phone = NULL
+		WHERE phone = ''
+		AND deleted_at IS NULL
+	`).Error; err != nil {
+		return fmt.Errorf("clean phone: %w", err)
+	}
+
+	if err := db.Exec(`
+		UPDATE users
+		SET bio = NULL
+		WHERE bio = ''
+		AND deleted_at IS NULL
+	`).Error; err != nil {
+		return fmt.Errorf("clean bio: %w", err)
+	}
+
+	if err := db.Exec(`
+		UPDATE users
+		SET avatar_url = NULL
+		WHERE avatar_url = ''
+		AND deleted_at IS NULL
+	`).Error; err != nil {
+		return fmt.Errorf("clean avatar_url: %w", err)
+	}
+
 	return nil
 }
