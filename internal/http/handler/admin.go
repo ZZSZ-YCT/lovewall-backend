@@ -143,10 +143,36 @@ func (h *AdminHandler) ListUsers(c *gin.Context) {
 			}
 		}
 	}
+
+	// Fetch active tags for listed users
+	tagMap := map[string]*model.Tag{}
+	if len(idList) > 0 {
+		var userTags []model.UserTag
+		if err := h.db.Preload("Tag").Where("user_id IN ? AND is_active = ? AND deleted_at IS NULL", idList, true).Find(&userTags).Error; err == nil {
+			for _, ut := range userTags {
+				tagMap[ut.UserID] = &ut.Tag
+			}
+		}
+	}
+
 	items := make([]gin.H, 0, len(users))
 	for i := range users {
 		u := sanitizeUser(h.db, &users[i])
 		u["permissions"] = permMap[users[i].ID]
+
+		// Add active tag info
+		if tag, exists := tagMap[users[i].ID]; exists && tag != nil {
+			u["active_tag"] = gin.H{
+				"id":               tag.ID,
+				"name":             tag.Name,
+				"title":            tag.Title,
+				"background_color": tag.BackgroundColor,
+				"text_color":       tag.TextColor,
+			}
+		} else {
+			u["active_tag"] = nil
+		}
+
 		items = append(items, u)
 	}
 	basichttp.OK(c, gin.H{"total": total, "items": items, "page": page, "page_size": size})

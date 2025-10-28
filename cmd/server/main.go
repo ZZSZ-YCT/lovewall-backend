@@ -109,7 +109,7 @@ func main() {
 	api.POST("/login", authH.Login)
 	api.POST("/logout", authH.Logout)
 	// Public user lookup endpoints
-	api.GET("/users", authH.UserList)
+	api.GET("/users/search", authH.UserList)
 	api.GET("/users/:id", authH.GetUserPublicByID)
 	api.GET("/users/by-username/:username", authH.GetUserPublicByUsername)
 	api.GET("/users/:id/status", authH.GetUserStatusByID)
@@ -168,7 +168,7 @@ func main() {
 	authed.POST("/admin/comments/:id/pin", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.PinComment)
 	authed.POST("/admin/comments/:id/unpin", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.UnpinComment)
 
-	authed.GET("/admin/users", mw.RequirePerm(database, "MANAGE_USERS"), adminH.ListUsers)
+	authed.GET("/users", mw.RequirePerm(database, "MANAGE_USERS"), adminH.ListUsers)
 	authed.PUT("/users/:id", authH.UpdateUser)
 	authed.POST("/users/:id/permissions", adminH.SetUserPermissions)
 	authed.PUT("/admin/users/:id/password", adminH.UpdateUserPassword)
