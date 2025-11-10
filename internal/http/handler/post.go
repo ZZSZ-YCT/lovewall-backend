@@ -270,7 +270,7 @@ func (h *PostHandler) GetPost(c *gin.Context) {
 			return
 		}
 		// Allow if superadmin or has any post moderation permission
-		if !mw.IsSuper(c) {
+		if !mw.IsSuper(c, h.db) {
 			var cnt int64
 			h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL",
 				uid, "MANAGE_POSTS").Scan(&cnt)
@@ -299,62 +299,15 @@ func since(t time.Time) string { return time.Since(t).String() }
 
 // enrichPostWithUserTag adds user tag information to post response
 func (h *PostHandler) enrichPostWithUserTag(post *model.Post) gin.H {
-	cardType := "confession"
-	if post.CardType != nil {
-		trimmed := strings.TrimSpace(*post.CardType)
-		if trimmed != "" {
-			cardType = trimmed
-		}
-	}
-	result := gin.H{
-		"id":                      post.ID,
-		"author_id":               post.AuthorID,
-		"author_name":             h.computeAuthorDisplayName(post),
-		"target_name":             post.TargetName,
-		"content":                 post.Content,
-		"images":                  h.getPostImages(post.ID),
-		"status":                  post.Status,
-		"is_pinned":               post.IsPinned,
-		"is_featured":             post.IsFeatured,
-		"is_locked":               post.IsLocked,
-		"confessor_mode":          post.ConfessorMode,
-		"card_type":               cardType,
-		"metadata":                post.Metadata,
-		"created_at":              post.CreatedAt,
-		"updated_at":              post.UpdatedAt,
-		"author_tag":              nil,
-		"is_author_admin":         false,
-		"view_count":              post.ViewCount,
-		"comment_count":           post.CommentCount,
-		"audit_status":            post.AuditStatus,
-		"audit_msg":               post.AuditMsg,
-		"manual_review_requested": post.ManualReviewRequested,
-		"is_pending_review":       post.AuditStatus == 1,
+	if post == nil {
+		return gin.H{}
 	}
 
-	// Get author's active tag and admin status
-	if tag, err := h.tagService.GetActiveUserTag(post.AuthorID); err == nil && tag != nil {
-		result["author_tag"] = gin.H{
-			"name":             tag.Name,
-			"title":            tag.Title,
-			"background_color": tag.BackgroundColor,
-			"text_color":       tag.TextColor,
-		}
+	items := h.enrichPostsWithUserTags([]model.Post{*post})
+	if len(items) > 0 {
+		return items[0]
 	}
-
-	// Check author admin permission
-	var user model.User
-	if err := h.db.Select("is_superadmin").First(&user, "id = ? AND deleted_at IS NULL", post.AuthorID).Error; err == nil {
-		if user.IsSuperadmin {
-			result["is_author_admin"] = true
-		} else {
-			var cnt int64
-			h.db.Model(&model.UserPermission{}).Where("user_id = ? AND deleted_at IS NULL", post.AuthorID).Count(&cnt)
-			result["is_author_admin"] = cnt > 0
-		}
-	}
-
-	return result
+	return gin.H{}
 }
 
 // getPostImages returns image URLs for a post in order
@@ -389,12 +342,208 @@ func (h *PostHandler) getUserDisplayName(userID string) string {
 	return ""
 }
 
-// enrichPostsWithUserTags adds user tag information to multiple posts
+// batchGetUserDisplayNames resolves display names for a set of user IDs in one query.
+func (h *PostHandler) batchGetUserDisplayNames(userIDs []string) map[string]string {
+	result := make(map[string]string)
+	if len(userIDs) == 0 {
+		return result
+	}
+
+	unique := make([]string, 0, len(userIDs))
+	seen := make(map[string]struct{}, len(userIDs))
+	for _, id := range userIDs {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	if len(unique) == 0 {
+		return result
+	}
+
+	var users []model.User
+	if err := h.db.Unscoped().Select("id, username, display_name").
+		Where("id IN ?", unique).
+		Find(&users).Error; err != nil {
+		return result
+	}
+	for i := range users {
+		name := users[i].Username
+		if users[i].DisplayName != nil && *users[i].DisplayName != "" {
+			name = *users[i].DisplayName
+		}
+		result[users[i].ID] = name
+	}
+	return result
+}
+
+// getUserDisplayNameCached gets a display name from a precomputed map.
+func getUserDisplayNameCached(userID string, nameMap map[string]string) string {
+	if nameMap == nil {
+		return ""
+	}
+	if name, ok := nameMap[userID]; ok {
+		return name
+	}
+	return ""
+}
+
+// enrichPostsWithUserTags adds user tag information to multiple posts (optimized batch query)
 func (h *PostHandler) enrichPostsWithUserTags(posts []model.Post) []gin.H {
+	if len(posts) == 0 {
+		return []gin.H{}
+	}
+
+	authorIDs := make([]string, 0, len(posts))
+	authorIDSet := make(map[string]bool)
+	for i := range posts {
+		if !authorIDSet[posts[i].AuthorID] {
+			authorIDs = append(authorIDs, posts[i].AuthorID)
+			authorIDSet[posts[i].AuthorID] = true
+		}
+	}
+
+	userTags, err := h.tagService.GetActiveUserTagsBatch(authorIDs)
+	if err != nil {
+		userTags = make(map[string]*model.Tag)
+	}
+
+	var users []model.User
+	userMap := make(map[string]*model.User)
+	if err := h.db.Select("id, username, display_name, is_superadmin, avatar_url, is_online, last_heartbeat").
+		Where("id IN ? AND deleted_at IS NULL", authorIDs).
+		Find(&users).Error; err == nil {
+		for i := range users {
+			userMap[users[i].ID] = &users[i]
+		}
+	}
+
+	type PermCount struct {
+		UserID string
+		Count  int64
+	}
+	var permCounts []PermCount
+	permMap := make(map[string]bool)
+	if err := h.db.Model(&model.UserPermission{}).
+		Select("user_id, COUNT(*) as count").
+		Where("user_id IN ? AND deleted_at IS NULL", authorIDs).
+		Group("user_id").
+		Scan(&permCounts).Error; err == nil {
+		for _, pc := range permCounts {
+			permMap[pc.UserID] = pc.Count > 0
+		}
+	}
+
+	postIDs := make([]string, len(posts))
+	for i := range posts {
+		postIDs[i] = posts[i].ID
+	}
+	var allImages []model.PostImage
+	imageMap := make(map[string][]string)
+	if err := h.db.Where("post_id IN ?", postIDs).
+		Order("post_id, sort_order ASC, created_at ASC").
+		Find(&allImages).Error; err == nil {
+		for _, img := range allImages {
+			imageMap[img.PostID] = append(imageMap[img.PostID], img.URL)
+		}
+	}
+
+	confessorUserIDs := make([]string, 0, len(posts))
+	confessorSet := make(map[string]struct{}, len(posts))
+	for i := range posts {
+		if posts[i].ConfessorMode != nil && *posts[i].ConfessorMode == "self" {
+			if _, ok := confessorSet[posts[i].AuthorID]; !ok {
+				confessorSet[posts[i].AuthorID] = struct{}{}
+				confessorUserIDs = append(confessorUserIDs, posts[i].AuthorID)
+			}
+		}
+	}
+	displayNameMap := h.batchGetUserDisplayNames(confessorUserIDs)
+
 	result := make([]gin.H, 0, len(posts))
 	for i := range posts {
-		result = append(result, h.enrichPostWithUserTag(&posts[i]))
+		post := &posts[i]
+
+		cardType := "confession"
+		if post.CardType != nil {
+			trimmed := strings.TrimSpace(*post.CardType)
+			if trimmed != "" {
+				cardType = trimmed
+			}
+		}
+
+		authorName := post.AuthorName
+		if post.ConfessorMode != nil && *post.ConfessorMode == "self" {
+			if name := getUserDisplayNameCached(post.AuthorID, displayNameMap); name != "" {
+				authorName = name
+			}
+		}
+
+		item := gin.H{
+			"id":                      post.ID,
+			"author_id":               post.AuthorID,
+			"author_name":             authorName,
+			"author_display_name":     nil,
+			"author_avatar_url":       nil,
+			"author_is_online":        false,
+			"author_last_heartbeat":   nil,
+			"target_name":             post.TargetName,
+			"content":                 post.Content,
+			"images":                  imageMap[post.ID],
+			"status":                  post.Status,
+			"is_pinned":               post.IsPinned,
+			"is_featured":             post.IsFeatured,
+			"is_locked":               post.IsLocked,
+			"confessor_mode":          post.ConfessorMode,
+			"card_type":               cardType,
+			"metadata":                post.Metadata,
+			"created_at":              post.CreatedAt,
+			"updated_at":              post.UpdatedAt,
+			"author_tag":              nil,
+			"is_author_admin":         false,
+			"view_count":              post.ViewCount,
+			"comment_count":           post.CommentCount,
+			"audit_status":            post.AuditStatus,
+			"audit_msg":               post.AuditMsg,
+			"manual_review_requested": post.ManualReviewRequested,
+			"is_pending_review":       post.AuditStatus == 1,
+		}
+
+		if tag, ok := userTags[post.AuthorID]; ok && tag != nil {
+			item["author_tag"] = gin.H{
+				"name":             tag.Name,
+				"title":            tag.Title,
+				"background_color": tag.BackgroundColor,
+				"text_color":       tag.TextColor,
+				"tag_type":         tag.TagType,
+				"css_styles":       tag.CssStyles,
+			}
+		}
+
+		if user, ok := userMap[post.AuthorID]; ok {
+			if user.IsSuperadmin {
+				item["is_author_admin"] = true
+			} else if permMap[post.AuthorID] {
+				item["is_author_admin"] = true
+			}
+			// Add complete author information
+			if user.DisplayName != nil && *user.DisplayName != "" {
+				item["author_display_name"] = *user.DisplayName
+			} else {
+				item["author_display_name"] = user.Username
+			}
+			item["author_avatar_url"] = user.AvatarURL
+			item["author_is_online"] = user.IsOnline
+			item["author_last_heartbeat"] = user.LastHeartbeat
+		}
+
+		result = append(result, item)
 	}
+
 	return result
 }
 
@@ -694,7 +843,7 @@ func (h *PostHandler) Update(c *gin.Context) {
 	}
 	uid, _ := c.Get(mw.CtxUserID)
 	// Only allow admins to edit posts, authors cannot edit
-	if !mw.IsSuper(c) {
+	if !mw.IsSuper(c, h.db) {
 		var cnt int64
 		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id=? AND permission=? AND deleted_at IS NULL", uid, "MANAGE_POSTS").Scan(&cnt)
 		if cnt == 0 {
@@ -770,7 +919,7 @@ func (h *PostHandler) Delete(c *gin.Context) {
 	uid, _ := c.Get(mw.CtxUserID)
 	operator := h.resolveOperatorName(c)
 	if uid != p.AuthorID {
-		if !mw.IsSuper(c) {
+		if !mw.IsSuper(c, h.db) {
 			var cnt int64
 			h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id=? AND permission=? AND deleted_at IS NULL", uid, "MANAGE_POSTS").Scan(&cnt)
 			if cnt == 0 {
@@ -826,7 +975,7 @@ func (h *PostHandler) Delete(c *gin.Context) {
 // query: status (0/1/2), author_id, featured=true, pinned=true, page, page_size
 func (h *PostHandler) ListModeration(c *gin.Context) {
 	// Permission check: allow superadmin or user having any of the post management permissions
-	if !mw.IsSuper(c) {
+	if !mw.IsSuper(c, h.db) {
 		uid, _ := c.Get(mw.CtxUserID)
 		var cnt int64
 		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL",
@@ -872,7 +1021,7 @@ func (h *PostHandler) ListModeration(c *gin.Context) {
 func (h *PostHandler) Restore(c *gin.Context) {
 	id := c.Param("id")
 	// Permission: MANAGE_POSTS or superadmin
-	if !mw.IsSuper(c) {
+	if !mw.IsSuper(c, h.db) {
 		uid, _ := c.Get(mw.CtxUserID)
 		var cnt int64
 		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id=? AND permission=? AND deleted_at IS NULL", uid, "MANAGE_POSTS").Scan(&cnt)

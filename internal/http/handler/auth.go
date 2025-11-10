@@ -294,7 +294,7 @@ func (h *AuthHandler) OnlineStatus(c *gin.Context) {
 	basichttp.OK(c, resp)
 }
 
-// POST /api/heartbeat (auth) — update user heartbeat
+// POST /api/heartbeat (auth) — update user heartbeat and return unread notification count
 func (h *AuthHandler) Heartbeat(c *gin.Context) {
 	uid, _ := c.Get(mw.CtxUserID)
 	now := time.Now()
@@ -305,7 +305,21 @@ func (h *AuthHandler) Heartbeat(c *gin.Context) {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "heartbeat update failed")
 		return
 	}
-	basichttp.OK(c, gin.H{"online": true, "timestamp": now})
+
+	// Query unread notification count
+	var unreadCount int64
+	if err := h.db.Model(&model.Notification{}).
+		Where("user_id = ? AND is_read = ? AND deleted_at IS NULL", uid, false).
+		Count(&unreadCount).Error; err != nil {
+		// Don't fail the whole request if notification query fails
+		unreadCount = 0
+	}
+
+	basichttp.OK(c, gin.H{
+		"online":               true,
+		"timestamp":            now,
+		"unread_notifications": unreadCount,
+	})
 }
 
 // helpers
@@ -395,51 +409,183 @@ func hasAnyAdminPermission(db *gorm.DB, userID string) bool {
 	return cnt > 0
 }
 
+// hasAnyAdminPermissionCached checks admin status using pre-fetched user and permission data.
+func hasAnyAdminPermissionCached(user *model.User, hasPermission bool) bool {
+	if user == nil {
+		return false
+	}
+	if user.IsSuperadmin {
+		return true
+	}
+	return hasPermission
+}
+
+// batchQueryAdminStatus fetches user admin indicators in a single pass.
+func batchQueryAdminStatus(db *gorm.DB, userIDs []string) (map[string]*model.User, map[string]bool, error) {
+	userMap := make(map[string]*model.User)
+	permMap := make(map[string]bool)
+	if len(userIDs) == 0 {
+		return userMap, permMap, nil
+	}
+
+	uniqueIDs := make([]string, 0, len(userIDs))
+	seen := make(map[string]struct{}, len(userIDs))
+	for _, id := range userIDs {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		uniqueIDs = append(uniqueIDs, id)
+	}
+	if len(uniqueIDs) == 0 {
+		return userMap, permMap, nil
+	}
+
+	var users []model.User
+	if err := db.Select("id, username, display_name, is_superadmin").
+		Where("id IN ? AND deleted_at IS NULL", uniqueIDs).
+		Find(&users).Error; err != nil {
+		return nil, nil, err
+	}
+	for i := range users {
+		userMap[users[i].ID] = &users[i]
+	}
+
+	type permCount struct {
+		UserID string
+		Count  int64
+	}
+	var permCounts []permCount
+	if err := db.Model(&model.UserPermission{}).
+		Select("user_id, COUNT(*) as count").
+		Where("user_id IN ? AND deleted_at IS NULL", uniqueIDs).
+		Group("user_id").
+		Scan(&permCounts).Error; err != nil {
+		return nil, nil, err
+	}
+	for _, pc := range permCounts {
+		permMap[pc.UserID] = pc.Count > 0
+	}
+
+	return userMap, permMap, nil
+}
+
 func sanitizeUser(db *gorm.DB, u *model.User) gin.H {
+	result := sanitizeUserCached(u, hasAnyAdminPermission(db, u.ID))
+
+	// Add active tag
+	tagService := service.NewUserTagService(db)
+	tag, _ := tagService.GetActiveUserTag(u.ID)
+	if tag != nil {
+		result["active_tag"] = gin.H{
+			"id":               tag.ID,
+			"name":             tag.Name,
+			"title":            tag.Title,
+			"background_color": tag.BackgroundColor,
+			"text_color":       tag.TextColor,
+			"tag_type":         tag.TagType,
+			"css_styles":       tag.CssStyles,
+		}
+	} else {
+		result["active_tag"] = nil
+	}
+
+	return result
+}
+
+// sanitizeUserCached formats user data using a precomputed admin flag.
+func sanitizeUserCached(u *model.User, isAdmin bool) gin.H {
+	if u == nil {
+		return gin.H{}
+	}
 	return gin.H{
-		"id":            u.ID,
-		"username":      u.Username,
-		"display_name":  u.DisplayName,
-		"email":         u.Email,
-		"phone":         u.Phone,
-		"avatar_url":    u.AvatarURL,
-		"bio":           u.Bio,
-		"is_superadmin": u.IsSuperadmin,
-		"status":        u.Status,
-		"is_banned":     u.IsBanned,
-		"ban_reason":    u.BanReason,
-		"last_login_at": u.LastLoginAt,
-		"last_ip":       u.LastIP,
-		"metadata":      u.Metadata,
-		"created_at":    u.CreatedAt,
-		"updated_at":    u.UpdatedAt,
-		"is_deleted":    u.DeletedAt != nil,
-		"is_admin":      hasAnyAdminPermission(db, u.ID),
+		"id":             u.ID,
+		"username":       u.Username,
+		"display_name":   u.DisplayName,
+		"email":          u.Email,
+		"phone":          u.Phone,
+		"avatar_url":     u.AvatarURL,
+		"bio":            u.Bio,
+		"is_superadmin":  u.IsSuperadmin,
+		"status":         u.Status,
+		"is_banned":      u.IsBanned,
+		"ban_reason":     u.BanReason,
+		"last_login_at":  u.LastLoginAt,
+		"last_ip":        u.LastIP,
+		"is_online":      u.IsOnline,
+		"last_heartbeat": u.LastHeartbeat,
+		"metadata":       u.Metadata,
+		"created_at":     u.CreatedAt,
+		"updated_at":     u.UpdatedAt,
+		"is_deleted":     u.DeletedAt != nil,
+		"is_admin":       isAdmin,
 	}
 }
 
 // Public-facing user response (no email/phone/sensitive fields)
 func sanitizeUserPublic(db *gorm.DB, u *model.User) gin.H {
 	if u.IsBanned {
-		return gin.H{
+		result := gin.H{
 			"id":         u.ID,
 			"username":   u.Username,
 			"is_banned":  true,
 			"is_deleted": u.DeletedAt != nil,
 			"is_admin":   hasAnyAdminPermission(db, u.ID),
 		}
+		// Add active tag even for banned users
+		tagService := service.NewUserTagService(db)
+		tag, _ := tagService.GetActiveUserTag(u.ID)
+		if tag != nil {
+			result["active_tag"] = gin.H{
+				"id":               tag.ID,
+				"name":             tag.Name,
+				"title":            tag.Title,
+				"background_color": tag.BackgroundColor,
+				"text_color":       tag.TextColor,
+				"tag_type":         tag.TagType,
+				"css_styles":       tag.CssStyles,
+			}
+		} else {
+			result["active_tag"] = nil
+		}
+		return result
 	}
-	return gin.H{
-		"id":           u.ID,
-		"username":     u.Username,
-		"display_name": u.DisplayName,
-		"avatar_url":   u.AvatarURL,
-		"status":       u.Status,
-		"created_at":   u.CreatedAt,
-		"updated_at":   u.UpdatedAt,
-		"is_deleted":   u.DeletedAt != nil,
-		"is_admin":     hasAnyAdminPermission(db, u.ID),
+
+	result := gin.H{
+		"id":             u.ID,
+		"username":       u.Username,
+		"display_name":   u.DisplayName,
+		"avatar_url":     u.AvatarURL,
+		"status":         u.Status,
+		"is_online":      u.IsOnline,
+		"last_heartbeat": u.LastHeartbeat,
+		"created_at":     u.CreatedAt,
+		"updated_at":     u.UpdatedAt,
+		"is_deleted":     u.DeletedAt != nil,
+		"is_admin":       hasAnyAdminPermission(db, u.ID),
 	}
+
+	// Add active tag
+	tagService := service.NewUserTagService(db)
+	tag, _ := tagService.GetActiveUserTag(u.ID)
+	if tag != nil {
+		result["active_tag"] = gin.H{
+			"id":               tag.ID,
+			"name":             tag.Name,
+			"title":            tag.Title,
+			"background_color": tag.BackgroundColor,
+			"text_color":       tag.TextColor,
+			"tag_type":         tag.TagType,
+			"css_styles":       tag.CssStyles,
+		}
+	} else {
+		result["active_tag"] = nil
+	}
+
+	return result
 }
 
 func sanitizeUserPublicList(u *model.User) gin.H {
@@ -474,7 +620,7 @@ func (h *AuthHandler) UpdateUser(c *gin.Context) {
 	// Check permission: self or MANAGE_USERS
 	isSelf := userID == currentUID
 	hasManageUsers := false
-	if mw.IsSuper(c) {
+	if mw.IsSuper(c, h.db) {
 		hasManageUsers = true
 	} else {
 		var cnt int64
@@ -1042,7 +1188,7 @@ func (h *AuthHandler) UserList(c *gin.Context) {
 
 	var users []model.User
 	query := h.db.WithContext(ctx).Model(&model.User{}).
-		Select("id, username, display_name").
+		Select("id, username, display_name, avatar_url, is_online, last_heartbeat").
 		Where("deleted_at IS NULL").
 		Order("username ASC")
 	if hasFilter {
@@ -1061,9 +1207,42 @@ func (h *AuthHandler) UserList(c *gin.Context) {
 	}
 	duration := time.Since(start)
 
+	// Batch query active tags for all users
+	userIDs := make([]string, len(users))
+	for i := range users {
+		userIDs[i] = users[i].ID
+	}
+	tagService := service.NewUserTagService(h.db)
+	userTags, _ := tagService.GetActiveUserTagsBatch(userIDs)
+
 	result := make([]gin.H, len(users))
 	for i := range users {
-		result[i] = sanitizeUserPublicList(&users[i])
+		u := &users[i]
+		var displayName any
+		if u.DisplayName != nil {
+			displayName = *u.DisplayName
+		}
+		item := gin.H{
+			"id":             u.ID,
+			"username":       u.Username,
+			"display_name":   displayName,
+			"avatar_url":     u.AvatarURL,
+			"is_online":      u.IsOnline,
+			"last_heartbeat": u.LastHeartbeat,
+			"active_tag":     nil,
+		}
+		if tag, ok := userTags[u.ID]; ok && tag != nil {
+			item["active_tag"] = gin.H{
+				"id":               tag.ID,
+				"name":             tag.Name,
+				"title":            tag.Title,
+				"background_color": tag.BackgroundColor,
+				"text_color":       tag.TextColor,
+				"tag_type":         tag.TagType,
+				"css_styles":       tag.CssStyles,
+			}
+		}
+		result[i] = item
 	}
 
 	if shouldCache {

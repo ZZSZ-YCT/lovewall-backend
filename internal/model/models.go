@@ -145,6 +145,8 @@ type Tag struct {
 	TextColor       string  `gorm:"not null" json:"text_color"`
 	Description     *string `json:"description,omitempty"`
 	IsActive        bool    `gorm:"not null;default:true;index" json:"is_active"`
+	TagType         string  `gorm:"type:varchar(20);not null;default:'collective';index" json:"tag_type"`
+	CssStyles       *string `gorm:"type:text" json:"css_styles,omitempty"`
 	Metadata        *string `json:"metadata,omitempty"`
 }
 

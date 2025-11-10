@@ -56,60 +56,117 @@ func (h *CommentHandler) ListForPost(c *gin.Context) {
 
 // enrichCommentWithUserTag adds user tag information to comment response
 func (h *CommentHandler) enrichCommentWithUserTag(comment *model.Comment) gin.H {
-	result := gin.H{
-		"id":                comment.ID,
-		"post_id":           comment.PostID,
-		"user_id":           comment.UserID,
-		"user_username":     nil,
-		"content":           comment.Content,
-		"status":            comment.Status,
-		"is_pinned":         comment.IsPinned,
-		"metadata":          comment.Metadata,
-		"created_at":        comment.CreatedAt,
-		"updated_at":        comment.UpdatedAt,
-		"user_tag":          nil,
-		"user_display_name": nil,
-		"is_user_admin":     false,
+	if comment == nil {
+		return gin.H{}
 	}
-
-	// Get user's active tag
-	if tag, err := h.tagService.GetActiveUserTag(comment.UserID); err == nil && tag != nil {
-		result["user_tag"] = gin.H{
-			"name":             tag.Name,
-			"title":            tag.Title,
-			"background_color": tag.BackgroundColor,
-			"text_color":       tag.TextColor,
-		}
+	items := h.enrichCommentsWithUserTags([]model.Comment{*comment})
+	if len(items) > 0 {
+		return items[0]
 	}
-
-	// Attach user's current display name (fallback to username if empty) and admin status
-	var user model.User
-	if err := h.db.Unscoped().Select("id, username, display_name, is_superadmin").First(&user, "id = ?", comment.UserID).Error; err == nil {
-		result["user_username"] = user.Username
-		if user.DisplayName != nil && *user.DisplayName != "" {
-			result["user_display_name"] = *user.DisplayName
-		} else {
-			result["user_display_name"] = user.Username
-		}
-		// Check admin permission
-		if user.IsSuperadmin {
-			result["is_user_admin"] = true
-		} else {
-			var cnt int64
-			h.db.Model(&model.UserPermission{}).Where("user_id = ? AND deleted_at IS NULL", user.ID).Count(&cnt)
-			result["is_user_admin"] = cnt > 0
-		}
-	}
-
-	return result
+	return gin.H{}
 }
 
-// enrichCommentsWithUserTags adds user tag information to multiple comments
+// enrichCommentsWithUserTags adds user tag information to multiple comments (optimized batch query)
 func (h *CommentHandler) enrichCommentsWithUserTags(comments []model.Comment) []gin.H {
+	if len(comments) == 0 {
+		return []gin.H{}
+	}
+
+	userIDs := make([]string, 0, len(comments))
+	userIDSet := make(map[string]bool)
+	for i := range comments {
+		if !userIDSet[comments[i].UserID] {
+			userIDs = append(userIDs, comments[i].UserID)
+			userIDSet[comments[i].UserID] = true
+		}
+	}
+
+	userTags, err := h.tagService.GetActiveUserTagsBatch(userIDs)
+	if err != nil {
+		userTags = make(map[string]*model.Tag)
+	}
+
+	var users []model.User
+	userMap := make(map[string]*model.User)
+	if err := h.db.Unscoped().Select("id, username, display_name, is_superadmin, avatar_url, is_online, last_heartbeat").
+		Where("id IN ?", userIDs).
+		Find(&users).Error; err == nil {
+		for i := range users {
+			userMap[users[i].ID] = &users[i]
+		}
+	}
+
+	type PermCount struct {
+		UserID string
+		Count  int64
+	}
+	var permCounts []PermCount
+	permMap := make(map[string]bool)
+	if err := h.db.Model(&model.UserPermission{}).
+		Select("user_id, COUNT(*) as count").
+		Where("user_id IN ? AND deleted_at IS NULL", userIDs).
+		Group("user_id").
+		Scan(&permCounts).Error; err == nil {
+		for _, pc := range permCounts {
+			permMap[pc.UserID] = pc.Count > 0
+		}
+	}
+
 	result := make([]gin.H, 0, len(comments))
 	for i := range comments {
-		result = append(result, h.enrichCommentWithUserTag(&comments[i]))
+		comment := &comments[i]
+		item := gin.H{
+			"id":                  comment.ID,
+			"post_id":             comment.PostID,
+			"user_id":             comment.UserID,
+			"user_username":       nil,
+			"user_display_name":   nil,
+			"user_avatar_url":     nil,
+			"user_is_online":      false,
+			"user_last_heartbeat": nil,
+			"content":             comment.Content,
+			"status":              comment.Status,
+			"is_pinned":           comment.IsPinned,
+			"metadata":            comment.Metadata,
+			"created_at":          comment.CreatedAt,
+			"updated_at":          comment.UpdatedAt,
+			"user_tag":            nil,
+			"is_user_admin":       false,
+		}
+
+		if tag, ok := userTags[comment.UserID]; ok && tag != nil {
+			item["user_tag"] = gin.H{
+				"name":             tag.Name,
+				"title":            tag.Title,
+				"background_color": tag.BackgroundColor,
+				"text_color":       tag.TextColor,
+				"tag_type":         tag.TagType,
+				"css_styles":       tag.CssStyles,
+			}
+		}
+
+		if user, ok := userMap[comment.UserID]; ok {
+			item["user_username"] = user.Username
+			if user.DisplayName != nil && *user.DisplayName != "" {
+				item["user_display_name"] = *user.DisplayName
+			} else {
+				item["user_display_name"] = user.Username
+			}
+			// Add complete user information
+			item["user_avatar_url"] = user.AvatarURL
+			item["user_is_online"] = user.IsOnline
+			item["user_last_heartbeat"] = user.LastHeartbeat
+
+			if user.IsSuperadmin {
+				item["is_user_admin"] = true
+			} else if permMap[comment.UserID] {
+				item["is_user_admin"] = true
+			}
+		}
+
+		result = append(result, item)
 	}
+
 	return result
 }
 
@@ -129,7 +186,7 @@ func (h *CommentHandler) Create(c *gin.Context) {
 	// Check if post is locked (admins can still comment)
 	if post.IsLocked {
 		// Check if user is admin (superadmin or MANAGE_POSTS)
-		if !mw.IsSuper(c) {
+		if !mw.IsSuper(c, h.db) {
 			uid, _ := c.Get(mw.CtxUserID)
 			var cnt int64
 			h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_POSTS").Scan(&cnt)
@@ -185,7 +242,7 @@ func (h *CommentHandler) Delete(c *gin.Context) {
 	}
 	uid, _ := c.Get(mw.CtxUserID)
 	if uid != cm.UserID {
-		if !mw.IsSuper(c) {
+		if !mw.IsSuper(c, h.db) {
 			var cnt int64
 			h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_COMMENTS").Scan(&cnt)
 			if cnt == 0 {
@@ -216,7 +273,7 @@ func (h *CommentHandler) Update(c *gin.Context) {
 	}
 	uid, _ := c.Get(mw.CtxUserID)
 	if uid != cm.UserID {
-		if !mw.IsSuper(c) {
+		if !mw.IsSuper(c, h.db) {
 			var cnt int64
 			h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_COMMENTS").Scan(&cnt)
 			if cnt == 0 {
@@ -228,7 +285,7 @@ func (h *CommentHandler) Update(c *gin.Context) {
 		// author time window
 		if time.Since(cm.CreatedAt) > 15*time.Minute {
 			// need MANAGE_COMMENTS unless super
-			if !mw.IsSuper(c) {
+			if !mw.IsSuper(c, h.db) {
 				var cnt int64
 				h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_COMMENTS").Scan(&cnt)
 				if cnt == 0 {
@@ -317,7 +374,7 @@ func (h *CommentHandler) Hide(c *gin.Context) {
 func (h *CommentHandler) PinComment(c *gin.Context) {
 	id := c.Param("id")
 	// Permission check: superadmin or MANAGE_POSTS
-	if !mw.IsSuper(c) {
+	if !mw.IsSuper(c, h.db) {
 		uid, _ := c.Get(mw.CtxUserID)
 		var cnt int64
 		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_POSTS").Scan(&cnt)
@@ -353,7 +410,7 @@ func (h *CommentHandler) PinComment(c *gin.Context) {
 func (h *CommentHandler) UnpinComment(c *gin.Context) {
 	id := c.Param("id")
 	// Permission check: superadmin or MANAGE_POSTS
-	if !mw.IsSuper(c) {
+	if !mw.IsSuper(c, h.db) {
 		uid, _ := c.Get(mw.CtxUserID)
 		var cnt int64
 		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_POSTS").Scan(&cnt)

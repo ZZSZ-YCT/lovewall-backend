@@ -200,7 +200,8 @@ func RequireAuth(secret string) gin.HandlerFunc {
 	}
 }
 
-func IsSuper(c *gin.Context) bool {
+// IsSuperCached reads superadmin status from JWT (cached, may be stale)
+func IsSuperCached(c *gin.Context) bool {
 	v, ok := c.Get(CtxIsSuper)
 	if !ok {
 		return false
@@ -209,10 +210,26 @@ func IsSuper(c *gin.Context) bool {
 	return b
 }
 
+// IsSuper checks superadmin status from database (realtime, always accurate)
+func IsSuper(c *gin.Context, db *gorm.DB) bool {
+	uidVal, ok := c.Get(CtxUserID)
+	if !ok {
+		return false
+	}
+	uid, _ := uidVal.(string)
+	var u struct {
+		IsSuperadmin bool
+	}
+	if err := db.Select("is_superadmin").First(&u, "id = ? AND deleted_at IS NULL", uid).Error; err != nil {
+		return false
+	}
+	return u.IsSuperadmin
+}
+
 // RequirePerm checks for a specific permission, superadmin always allowed.
 func RequirePerm(db *gorm.DB, perm string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if IsSuper(c) {
+		if IsSuper(c, db) {
 			c.Next()
 			return
 		}

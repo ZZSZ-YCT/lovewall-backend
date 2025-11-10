@@ -1,13 +1,17 @@
 package handler
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"lovewall/internal/config"
 	basichttp "lovewall/internal/http"
@@ -23,6 +27,21 @@ type TagHandler struct {
 
 const tagTitleMaxWeight = 12
 
+const (
+	tagTypeCollective = "collective"
+	tagTypePersonal   = "personal"
+)
+
+var disallowedCSSKeywords = []string{
+	"@import",
+	"url(",
+	"expression(",
+	"javascript:",
+	"data:",
+}
+
+var hexColorRegex = regexp.MustCompile(`^#[0-9A-Fa-f]{6}$`)
+
 func NewTagHandler(db *gorm.DB, cfg *config.Config) *TagHandler {
 	return &TagHandler{db: db, cfg: cfg}
 }
@@ -32,9 +51,11 @@ func NewTagHandler(db *gorm.DB, cfg *config.Config) *TagHandler {
 type CreateTagRequest struct {
 	Name            string  `json:"name" binding:"required,min=1,max=50"`
 	Title           string  `json:"title" binding:"required,min=1,max=100"`
-	BackgroundColor string  `json:"background_color" binding:"required,len=7"` // #RRGGBB
-	TextColor       string  `json:"text_color" binding:"required,len=7"`       // #RRGGBB
+	BackgroundColor string  `json:"background_color"` // #RRGGBB
+	TextColor       string  `json:"text_color"`       // #RRGGBB
 	Description     *string `json:"description"`
+	TagType         string  `json:"tagType"`
+	CssStyles       *string `json:"cssStyles"`
 }
 
 func (h *TagHandler) CreateTag(c *gin.Context) {
@@ -46,6 +67,8 @@ func (h *TagHandler) CreateTag(c *gin.Context) {
 
 	req.Name = strings.TrimSpace(req.Name)
 	req.Title = strings.TrimSpace(req.Title)
+	req.BackgroundColor = strings.TrimSpace(req.BackgroundColor)
+	req.TextColor = strings.TrimSpace(req.TextColor)
 	if req.Name == "" || req.Title == "" {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "name and title are required")
 		return
@@ -53,6 +76,50 @@ func (h *TagHandler) CreateTag(c *gin.Context) {
 	if !validateTagTitle(req.Title) {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "title must be within 6 Chinese characters or 12 English letters")
 		return
+	}
+	req.TagType = normalizeTagType(req.TagType)
+	if !isValidTagType(req.TagType) {
+		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "tagType 仅支持 collective 或 personal")
+		return
+	}
+
+	var cssValue string
+	if req.CssStyles != nil {
+		cssValue = strings.TrimSpace(*req.CssStyles)
+	}
+	hasCss := req.CssStyles != nil && cssValue != ""
+	hasColors := req.BackgroundColor != "" || req.TextColor != ""
+
+	if hasCss && hasColors {
+		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "cssStyles 和颜色字段(background_color/text_color)互斥，只能提供其中一种")
+		return
+	}
+	if !hasCss && !hasColors {
+		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "必须提供 cssStyles 或颜色字段(background_color/text_color)其中一种")
+		return
+	}
+
+	if hasColors {
+		if req.BackgroundColor == "" || !hexColorRegex.MatchString(req.BackgroundColor) {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "background_color 格式错误，应为 #RRGGBB")
+			return
+		}
+		if req.TextColor == "" || !hexColorRegex.MatchString(req.TextColor) {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "text_color 格式错误，应为 #RRGGBB")
+			return
+		}
+	}
+
+	var cssPtr *string
+	if hasCss {
+		if err := validateCSSStyles(cssValue); err != nil {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", err.Error())
+			return
+		}
+		cssCopy := cssValue
+		cssPtr = &cssCopy
+		req.BackgroundColor = ""
+		req.TextColor = ""
 	}
 
 	// Check name uniqueness
@@ -70,12 +137,15 @@ func (h *TagHandler) CreateTag(c *gin.Context) {
 		TextColor:       req.TextColor,
 		Description:     req.Description,
 		IsActive:        true,
+		TagType:         req.TagType,
+		CssStyles:       cssPtr,
 	}
 
 	if err := h.db.Create(tag).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "create failed")
 		return
 	}
+	tag.TagType = sanitizeTagType(tag.TagType)
 	// Log operation
 	if uid, ok := c.Get(mw.CtxUserID); ok {
 		if uidStr, ok2 := uid.(string); ok2 {
@@ -111,6 +181,10 @@ func (h *TagHandler) ListTags(c *gin.Context) {
 		return
 	}
 
+	for i := range items {
+		items[i].TagType = sanitizeTagType(items[i].TagType)
+	}
+
 	basichttp.OK(c, gin.H{
 		"total":     total,
 		"items":     items,
@@ -126,6 +200,7 @@ func (h *TagHandler) GetTag(c *gin.Context) {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "tag not found")
 		return
 	}
+	tag.TagType = sanitizeTagType(tag.TagType)
 	basichttp.OK(c, tag)
 }
 
@@ -135,6 +210,8 @@ type UpdateTagRequest struct {
 	TextColor       *string `json:"text_color"`
 	Description     *string `json:"description"`
 	IsActive        *bool   `json:"is_active"`
+	TagType         *string `json:"tagType"`
+	CssStyles       *string `json:"cssStyles"`
 }
 
 func (h *TagHandler) UpdateTag(c *gin.Context) {
@@ -148,6 +225,27 @@ func (h *TagHandler) UpdateTag(c *gin.Context) {
 	var tag model.Tag
 	if err := h.db.First(&tag, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "tag not found")
+		return
+	}
+
+	var cssValue string
+	if req.CssStyles != nil {
+		cssValue = strings.TrimSpace(*req.CssStyles)
+	}
+	var bgValue string
+	if req.BackgroundColor != nil {
+		bgValue = strings.TrimSpace(*req.BackgroundColor)
+	}
+	var textValue string
+	if req.TextColor != nil {
+		textValue = strings.TrimSpace(*req.TextColor)
+	}
+
+	hasCss := req.CssStyles != nil && cssValue != ""
+	hasColors := (req.BackgroundColor != nil && bgValue != "") || (req.TextColor != nil && textValue != "")
+
+	if hasCss && hasColors {
+		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "cssStyles 和颜色字段互斥，只能更新其中一种")
 		return
 	}
 
@@ -165,16 +263,51 @@ func (h *TagHandler) UpdateTag(c *gin.Context) {
 		updates["title"] = title
 	}
 	if req.BackgroundColor != nil {
-		updates["background_color"] = *req.BackgroundColor
+		if bgValue != "" && !hexColorRegex.MatchString(bgValue) {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "background_color 格式错误，应为 #RRGGBB")
+			return
+		}
+		updates["background_color"] = bgValue
 	}
 	if req.TextColor != nil {
-		updates["text_color"] = *req.TextColor
+		if textValue != "" && !hexColorRegex.MatchString(textValue) {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "text_color 格式错误，应为 #RRGGBB")
+			return
+		}
+		updates["text_color"] = textValue
 	}
 	if req.Description != nil {
 		updates["description"] = *req.Description
 	}
+	if req.TagType != nil {
+		tagType := normalizeTagType(*req.TagType)
+		if !isValidTagType(tagType) {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "tagType 仅支持 collective 或 personal")
+			return
+		}
+		updates["tag_type"] = tagType
+	}
+	if req.CssStyles != nil {
+		if cssValue == "" {
+			updates["css_styles"] = gorm.Expr("NULL")
+		} else {
+			if err := validateCSSStyles(cssValue); err != nil {
+				basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", err.Error())
+				return
+			}
+			updates["css_styles"] = cssValue
+		}
+	}
 	if req.IsActive != nil {
 		updates["is_active"] = *req.IsActive
+	}
+
+	if hasCss {
+		updates["background_color"] = ""
+		updates["text_color"] = ""
+	}
+	if hasColors && req.CssStyles == nil {
+		updates["css_styles"] = gorm.Expr("NULL")
 	}
 
 	if len(updates) == 0 {
@@ -189,6 +322,7 @@ func (h *TagHandler) UpdateTag(c *gin.Context) {
 
 	// Reload updated tag
 	h.db.First(&tag, "id = ?", id)
+	tag.TagType = sanitizeTagType(tag.TagType)
 	if uid, ok := c.Get(mw.CtxUserID); ok {
 		if uidStr, ok2 := uid.(string); ok2 {
 			service.LogOperation(h.db, uidStr, "update_tag", "tag", id, nil)
@@ -276,20 +410,19 @@ func (h *TagHandler) GenerateRedemptionCodes(c *gin.Context) {
 	redemptionCodes := make([]model.RedemptionCode, 0, len(codes))
 
 	for _, code := range codes {
-		rc := model.RedemptionCode{
+		redemptionCodes = append(redemptionCodes, model.RedemptionCode{
 			Code:      code,
 			TagID:     req.TagID,
 			IsUsed:    false,
 			ExpiresAt: req.ExpiresAt,
 			BatchID:   &batchID,
-		}
+		})
+	}
 
-		if err := tx.Create(&rc).Error; err != nil {
-			tx.Rollback()
-			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to save codes")
-			return
-		}
-		redemptionCodes = append(redemptionCodes, rc)
+	if err := tx.CreateInBatches(&redemptionCodes, 100).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to save codes")
+		return
 	}
 
 	if err := tx.Commit().Error; err != nil {
@@ -365,12 +498,13 @@ func (h *TagHandler) GetRedemptionCodeByCode(c *gin.Context) {
 }
 
 // POST /api/admin/users/:id/tags/:tag_id (auth; MANAGE_TAGS)
-// Assign specified tag to user. If body {"active": true}, set it as active and deactivate others.
+// Assign specified tag to user. Body supports {"active": true, "force": true} to bypass activation limits.
 func (h *TagHandler) AssignUserTagToUser(c *gin.Context) {
 	userID := c.Param("id")
 	tagID := c.Param("tag_id")
 	var body struct {
 		Active bool `json:"active"`
+		Force  bool `json:"force"`
 	}
 	_ = c.ShouldBindJSON(&body)
 
@@ -380,6 +514,7 @@ func (h *TagHandler) AssignUserTagToUser(c *gin.Context) {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "tag not found")
 		return
 	}
+	tagType := sanitizeTagType(tag.TagType)
 
 	// Use transaction to ensure atomicity
 	tx := h.db.Begin()
@@ -391,20 +526,30 @@ func (h *TagHandler) AssignUserTagToUser(c *gin.Context) {
 
 	// Check if user already has this tag
 	var existing model.UserTag
-	err := tx.First(&existing, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, tagID).Error
+	err := tx.Preload("Tag").First(&existing, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, tagID).Error
 	if err == nil {
 		// Already has tag; update active flag based on body.Active
 		if body.Active {
-			// Deactivate others and activate this one
-			if err := tx.Model(&model.UserTag{}).Where("user_id = ? AND deleted_at IS NULL", userID).Update("is_active", false).Error; err != nil {
-				tx.Rollback()
-				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
-				return
-			}
-			if err := tx.Model(&existing).Update("is_active", true).Error; err != nil {
-				tx.Rollback()
-				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
-				return
+			if !existing.IsActive {
+				if !body.Force {
+					limit := activationLimitForType(tagType)
+					count, err := h.countActiveTagsByType(tx, userID, tagType, existing.TagID)
+					if err != nil {
+						tx.Rollback()
+						basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+						return
+					}
+					if count >= int64(limit) {
+						tx.Rollback()
+						basichttp.Fail(c, http.StatusBadRequest, "LIMIT_EXCEEDED", "已达到该类型Tag的激活上限")
+						return
+					}
+				}
+				if err := tx.Model(&existing).Update("is_active", true).Error; err != nil {
+					tx.Rollback()
+					basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
+					return
+				}
 			}
 		} else {
 			// Ensure this tag is not active when body.Active is false
@@ -419,12 +564,19 @@ func (h *TagHandler) AssignUserTagToUser(c *gin.Context) {
 			return
 		}
 		h.db.Preload("Tag").First(&existing, "id = ?", existing.ID)
+		existing.Tag.TagType = sanitizeTagType(existing.Tag.TagType)
 		if uid, ok := c.Get(mw.CtxUserID); ok {
 			if uidStr, ok2 := uid.(string); ok2 {
-				service.LogOperation(h.db, uidStr, "assign_user_tag", "user", userID, map[string]any{"tag_id": tagID, "active": body.Active})
+				service.LogOperation(h.db, uidStr, "assign_user_tag", "user", userID, map[string]any{"tag_id": tagID, "active": body.Active, "force": body.Force})
 			}
 		}
 		basichttp.OK(c, existing)
+		return
+	}
+
+	if err != nil && err != gorm.ErrRecordNotFound {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
 		return
 	}
 
@@ -436,11 +588,19 @@ func (h *TagHandler) AssignUserTagToUser(c *gin.Context) {
 		IsActive:   false,
 	}
 	if body.Active {
-		// Deactivate others and mark this active
-		if err := tx.Model(&model.UserTag{}).Where("user_id = ? AND deleted_at IS NULL", userID).Update("is_active", false).Error; err != nil {
-			tx.Rollback()
-			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
-			return
+		if !body.Force {
+			limit := activationLimitForType(tagType)
+			count, err := h.countActiveTagsByType(tx, userID, tagType, "")
+			if err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+				return
+			}
+			if count >= int64(limit) {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusBadRequest, "LIMIT_EXCEEDED", "已达到该类型Tag的激活上限")
+				return
+			}
 		}
 		ut.IsActive = true
 	}
@@ -455,9 +615,10 @@ func (h *TagHandler) AssignUserTagToUser(c *gin.Context) {
 		return
 	}
 	h.db.Preload("Tag").First(&ut, "id = ?", ut.ID)
+	ut.Tag.TagType = sanitizeTagType(ut.Tag.TagType)
 	if uid, ok := c.Get(mw.CtxUserID); ok {
 		if uidStr, ok2 := uid.(string); ok2 {
-			service.LogOperation(h.db, uidStr, "assign_user_tag", "user", userID, map[string]any{"tag_id": tagID, "active": body.Active})
+			service.LogOperation(h.db, uidStr, "assign_user_tag", "user", userID, map[string]any{"tag_id": tagID, "active": body.Active, "force": body.Force})
 		}
 	}
 	basichttp.JSON(c, http.StatusCreated, ut)
@@ -501,46 +662,58 @@ func (h *TagHandler) RedeemCode(c *gin.Context) {
 	uid, _ := c.Get(mw.CtxUserID)
 	userID := uid.(string)
 
-	// Find the redemption code
+	tx := h.db.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
+
 	var code model.RedemptionCode
-	if err := h.db.Preload("Tag").First(&code, "code = ? AND deleted_at IS NULL", req.Code).Error; err != nil {
-		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "invalid redemption code")
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Preload("Tag").
+		First(&code, "code = ? AND deleted_at IS NULL", req.Code).Error; err != nil {
+		tx.Rollback()
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "invalid redemption code")
+			return
+		}
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
 		return
 	}
 
-	// Check if already used
 	if code.IsUsed {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusConflict, "CONFLICT", "redemption code already used")
 		return
 	}
-
-	// Check expiration
 	if code.ExpiresAt != nil && time.Now().After(*code.ExpiresAt) {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusGone, "EXPIRED", "redemption code has expired")
 		return
 	}
-
-	// Check if tag is active
 	if !code.Tag.IsActive {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "tag is no longer available")
 		return
 	}
 
-	// Check if user already has this tag
 	var existingUserTag model.UserTag
-	err := h.db.First(&existingUserTag, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, code.TagID).Error
-	if err == nil {
+	if err := tx.First(&existingUserTag, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, code.TagID).Error; err == nil {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusConflict, "CONFLICT", "you already have this tag")
+		return
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "redeem failed")
 		return
 	}
 
-	// Transaction to redeem code
-	tx := h.db.Begin()
-
-	// Deactivate all existing user tags to ensure only one active tag
-	if err := tx.Model(&model.UserTag{}).
-		Where("user_id = ? AND deleted_at IS NULL", userID).
-		Update("is_active", false).Error; err != nil {
+	tagType := sanitizeTagType(code.Tag.TagType)
+	limit := activationLimitForType(tagType)
+	activeCount, err := h.countActiveTagsByType(tx, userID, tagType, "")
+	if err != nil {
 		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "redeem failed")
 		return
@@ -563,7 +736,7 @@ func (h *TagHandler) RedeemCode(c *gin.Context) {
 		UserID:     userID,
 		TagID:      code.TagID,
 		ObtainedAt: now,
-		IsActive:   true,
+		IsActive:   activeCount < int64(limit),
 	}
 
 	if err := tx.Create(&userTag).Error; err != nil {
@@ -579,11 +752,18 @@ func (h *TagHandler) RedeemCode(c *gin.Context) {
 
 	// Load user tag with relations
 	h.db.Preload("Tag").First(&userTag, "id = ?", userTag.ID)
+	userTag.Tag.TagType = sanitizeTagType(userTag.Tag.TagType)
+
+	message := "Tag redeemed successfully"
+	if !userTag.IsActive {
+		message = "兑换成功，已添加但需手动激活"
+	}
 
 	basichttp.OK(c, gin.H{
-		"success":  true,
-		"message":  "Tag redeemed successfully",
-		"user_tag": userTag,
+		"success":   true,
+		"message":   message,
+		"user_tag":  userTag,
+		"activated": userTag.IsActive,
 	})
 }
 
@@ -622,6 +802,8 @@ func (h *TagHandler) ListUserTags(c *gin.Context) {
 					"background_color": ut.Tag.BackgroundColor,
 					"text_color":       ut.Tag.TextColor,
 					"is_active":        ut.Tag.IsActive,
+					"tag_type":         sanitizeTagType(ut.Tag.TagType),
+					"css_styles":       ut.Tag.CssStyles,
 				},
 				"obtained_at": ut.ObtainedAt,
 				"is_active":   ut.IsActive,
@@ -638,7 +820,44 @@ func (h *TagHandler) ListUserTags(c *gin.Context) {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
 		return
 	}
+	for i := range userTags {
+		userTags[i].Tag.TagType = sanitizeTagType(userTags[i].Tag.TagType)
+	}
 	basichttp.OK(c, userTags)
+}
+
+// GetMyActiveTags returns active tags grouped by type for the current user.
+func (h *TagHandler) GetMyActiveTags(c *gin.Context) {
+	uid, _ := c.Get(mw.CtxUserID)
+	userID := uid.(string)
+
+	var userTags []model.UserTag
+	if err := h.db.Preload("Tag").
+		Joins("JOIN tags ON tags.id = user_tags.tag_id").
+		Where("user_tags.user_id = ? AND user_tags.deleted_at IS NULL AND user_tags.is_active = ?", userID, true).
+		Where("tags.deleted_at IS NULL").
+		Find(&userTags).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+		return
+	}
+
+	personal := make([]model.Tag, 0)
+	collective := make([]model.Tag, 0)
+
+	for i := range userTags {
+		tag := userTags[i].Tag
+		tag.TagType = sanitizeTagType(tag.TagType)
+		if tag.TagType == tagTypePersonal {
+			personal = append(personal, tag)
+		} else {
+			collective = append(collective, tag)
+		}
+	}
+
+	basichttp.OK(c, gin.H{
+		"personal":   personal,
+		"collective": collective,
+	})
 }
 
 func (h *TagHandler) SetActiveTag(c *gin.Context) {
@@ -646,24 +865,148 @@ func (h *TagHandler) SetActiveTag(c *gin.Context) {
 	uid, _ := c.Get(mw.CtxUserID)
 	userID := uid.(string)
 
-	// Verify user has this tag
+	tx := h.db.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
+
 	var userTag model.UserTag
-	if err := h.db.Preload("Tag").First(&userTag, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, tagID).Error; err != nil {
+	if err := tx.Preload("Tag").First(&userTag, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, tagID).Error; err != nil {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "tag not found")
 		return
 	}
 
-	// Deactivate all other tags for this user
-	h.db.Model(&model.UserTag{}).Where("user_id = ? AND deleted_at IS NULL", userID).Update("is_active", false)
+	if userTag.IsActive {
+		if err := tx.Commit().Error; err != nil {
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+			return
+		}
+		userTag.Tag.TagType = sanitizeTagType(userTag.Tag.TagType)
+		basichttp.OK(c, gin.H{
+			"message": "Tag 已激活",
+			"tag":     userTag.Tag,
+		})
+		return
+	}
 
-	// Activate this tag
-	if err := h.db.Model(&userTag).Update("is_active", true).Error; err != nil {
+	autoDeactivated := false
+	var autoDeactivatedTagID string
+	var autoDeactivatedUserTagID string
+	tagType := sanitizeTagType(userTag.Tag.TagType)
+	limit := activationLimitForType(tagType)
+	activeCount, err := h.countActiveTagsByType(tx, userID, tagType, "")
+	if err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+		return
+	}
+	if activeCount >= int64(limit) {
+		var oldestUserTag model.UserTag
+		err := tx.Joins("JOIN tags ON tags.id = user_tags.tag_id").
+			Where("user_tags.user_id = ? AND user_tags.is_active = ? AND user_tags.tag_id <> ?", userID, true, tagID).
+			Where("user_tags.deleted_at IS NULL").
+			Where("tags.deleted_at IS NULL").
+			Where("LOWER(COALESCE(NULLIF(tags.tag_type, ''), ?)) = ?", tagTypeCollective, tagType).
+			Order("user_tags.obtained_at ASC").
+			First(&oldestUserTag).Error
+		if err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to find oldest tag")
+			return
+		}
+		if err := tx.Model(&model.UserTag{}).Where("id = ?", oldestUserTag.ID).Update("is_active", false).Error; err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to deactivate oldest tag")
+			return
+		}
+		autoDeactivated = true
+		autoDeactivatedTagID = oldestUserTag.TagID
+		autoDeactivatedUserTagID = oldestUserTag.ID
+	}
+
+	if err := tx.Model(&model.UserTag{}).Where("id = ?", userTag.ID).Update("is_active", true).Error; err != nil {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
 		return
 	}
 
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+		return
+	}
+
+	h.db.Preload("Tag").First(&userTag, "id = ?", userTag.ID)
+	userTag.Tag.TagType = sanitizeTagType(userTag.Tag.TagType)
+
+	if autoDeactivated {
+		service.LogOperation(h.db, userID, "auto_deactivate_tag", "user_tag", autoDeactivatedUserTagID, map[string]any{"tag_id": autoDeactivatedTagID})
+	}
+
+	response := gin.H{
+		"message": "Tag 已激活",
+		"tag":     userTag.Tag,
+	}
+	if autoDeactivated {
+		response["auto_deactivated_tag_id"] = autoDeactivatedTagID
+	}
+
+	basichttp.OK(c, response)
+}
+
+// DeactivateTag allows the current user to deactivate a specific tag manually.
+func (h *TagHandler) DeactivateTag(c *gin.Context) {
+	tagID := c.Param("tag_id")
+	uid, _ := c.Get(mw.CtxUserID)
+	userID := uid.(string)
+
+	tx := h.db.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
+
+	var userTag model.UserTag
+	if err := tx.Preload("Tag").First(&userTag, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, tagID).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "tag not found")
+		return
+	}
+
+	if !userTag.IsActive {
+		if err := tx.Commit().Error; err != nil {
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+			return
+		}
+		userTag.Tag.TagType = sanitizeTagType(userTag.Tag.TagType)
+		basichttp.OK(c, gin.H{
+			"message": "Tag 已处于未激活状态",
+			"tag":     userTag.Tag,
+		})
+		return
+	}
+
+	if err := tx.Model(&userTag).Update("is_active", false).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
+		return
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+		return
+	}
+
+	h.db.Preload("Tag").First(&userTag, "id = ?", userTag.ID)
+	userTag.Tag.TagType = sanitizeTagType(userTag.Tag.TagType)
+
 	basichttp.OK(c, gin.H{
-		"message": "Active tag updated successfully",
+		"message": "Tag 已取消激活",
 		"tag":     userTag.Tag,
 	})
 }
@@ -700,6 +1043,8 @@ func (h *TagHandler) AdminListUserTags(c *gin.Context) {
 				"background_color": ut.Tag.BackgroundColor,
 				"text_color":       ut.Tag.TextColor,
 				"is_active":        ut.Tag.IsActive,
+				"tag_type":         sanitizeTagType(ut.Tag.TagType),
+				"css_styles":       ut.Tag.CssStyles,
 			},
 			"obtained_at": ut.ObtainedAt,
 			"is_active":   ut.IsActive,
@@ -731,10 +1076,12 @@ func (h *TagHandler) MyCurrentTagStatus(c *gin.Context) {
 		"has_active":          true,
 		"current_tag_enabled": enabled,
 		"tag": gin.H{
-			"id":        ut.Tag.ID,
-			"name":      ut.Tag.Name,
-			"title":     ut.Tag.Title,
-			"is_active": ut.Tag.IsActive,
+			"id":         ut.Tag.ID,
+			"name":       ut.Tag.Name,
+			"title":      ut.Tag.Title,
+			"is_active":  ut.Tag.IsActive,
+			"tag_type":   sanitizeTagType(ut.Tag.TagType),
+			"css_styles": ut.Tag.CssStyles,
 		},
 		"status": status,
 	})
@@ -760,10 +1107,12 @@ func (h *TagHandler) MyTagStatusByTagID(c *gin.Context) {
 	}
 	basichttp.OK(c, gin.H{
 		"tag": gin.H{
-			"id":        ut.Tag.ID,
-			"name":      ut.Tag.Name,
-			"title":     ut.Tag.Title,
-			"is_active": ut.Tag.IsActive,
+			"id":         ut.Tag.ID,
+			"name":       ut.Tag.Name,
+			"title":      ut.Tag.Title,
+			"is_active":  ut.Tag.IsActive,
+			"tag_type":   sanitizeTagType(ut.Tag.TagType),
+			"css_styles": ut.Tag.CssStyles,
 		},
 		"enabled": enabled,
 		"status":  status,
@@ -832,6 +1181,77 @@ func (h *TagHandler) DeleteRedemptionCodes(c *gin.Context) {
 	}
 	basichttp.OK(c, gin.H{"deleted": deleted, "skipped": skipped})
 }
+
+func normalizeTagType(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return tagTypeCollective
+	}
+	return value
+}
+
+func sanitizeTagType(value string) string {
+	value = normalizeTagType(value)
+	if !isValidTagType(value) {
+		return tagTypeCollective
+	}
+	return value
+}
+
+func isValidTagType(value string) bool {
+	switch value {
+	case tagTypeCollective, tagTypePersonal:
+		return true
+	default:
+		return false
+	}
+}
+
+func activationLimitForType(tagType string) int {
+	switch sanitizeTagType(tagType) {
+	case tagTypePersonal:
+		return 2
+	default:
+		return 1
+	}
+}
+
+func (h *TagHandler) countActiveTagsByType(tx *gorm.DB, userID, tagType, excludeTagID string) (int64, error) {
+	if tx == nil {
+		tx = h.db
+	}
+	tagType = sanitizeTagType(tagType)
+
+	var count int64
+	query := tx.Model(&model.UserTag{}).
+		Joins("JOIN tags ON tags.id = user_tags.tag_id").
+		Where("user_tags.user_id = ? AND user_tags.deleted_at IS NULL AND user_tags.is_active = ?", userID, true).
+		Where("tags.deleted_at IS NULL").
+		Where("LOWER(COALESCE(NULLIF(tags.tag_type, ''), ?)) = ?", tagTypeCollective, tagType)
+
+	if excludeTagID != "" {
+		query = query.Where("user_tags.tag_id <> ?", excludeTagID)
+	}
+
+	if err := query.Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func validateCSSStyles(css string) error {
+	if len(css) > 5000 {
+		return fmt.Errorf("CSS 样式长度不能超过 5000 个字符")
+	}
+	lower := strings.ToLower(css)
+	for _, keyword := range disallowedCSSKeywords {
+		if strings.Contains(lower, keyword) {
+			return fmt.Errorf("CSS 样式包含不安全的关键字")
+		}
+	}
+	return nil
+}
+
 func validateTagTitle(title string) bool {
 	trimmed := strings.TrimSpace(title)
 	if trimmed == "" {

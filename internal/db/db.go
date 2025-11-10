@@ -84,6 +84,10 @@ func AutoMigrate(db *gorm.DB) error {
 		return err
 	}
 
+	if err := db.Exec("UPDATE tags SET tag_type = 'collective' WHERE tag_type IS NULL OR tag_type = ''").Error; err != nil {
+		return fmt.Errorf("initialize tag_type values: %w", err)
+	}
+
 	// Auto-migrate card_type column
 	if err := MigrateCardType(db); err != nil {
 		return err

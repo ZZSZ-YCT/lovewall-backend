@@ -211,9 +211,11 @@ func main() {
 	authed.GET("/admin/logs/submissions", logH.ListSubmissionLogs)
 	authed.GET("/admin/logs/operations", logH.ListOperationLogs)
 	authed.GET("/my/tags", tagH.ListUserTags)
+	authed.GET("/my/tags/active", tagH.GetMyActiveTags)
 	authed.GET("/my/tags/current-status", tagH.MyCurrentTagStatus)
 	authed.GET("/my/tags/:tag_id/status", tagH.MyTagStatusByTagID)
 	authed.POST("/my/tags/:tag_id/activate", tagH.SetActiveTag)
+	authed.DELETE("/my/tags/:tag_id/activate", tagH.DeactivateTag)
 	// Notifications
 	authed.GET("/notifications", notifyH.List)
 	authed.GET("/notifications/unread-count", notifyH.UnreadCount)

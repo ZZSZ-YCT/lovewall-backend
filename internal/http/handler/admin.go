@@ -34,7 +34,7 @@ type permBody struct {
 }
 
 func (h *AdminHandler) SetUserPermissions(c *gin.Context) {
-	if !mw.IsSuper(c) {
+	if !mw.IsSuper(c, h.db) {
 		basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "superadmin required")
 		return
 	}
@@ -155,14 +155,29 @@ func (h *AdminHandler) ListUsers(c *gin.Context) {
 		}
 	}
 
+	userMap, adminPermMap, err := batchQueryAdminStatus(h.db, idList)
+	if err != nil {
+		userMap = make(map[string]*model.User)
+		adminPermMap = make(map[string]bool)
+	}
+
 	items := make([]gin.H, 0, len(users))
 	for i := range users {
-		u := sanitizeUser(h.db, &users[i])
-		u["permissions"] = permMap[users[i].ID]
+		userID := users[i].ID
+		isAdmin := hasAnyAdminPermissionCached(&users[i], adminPermMap[userID])
+		if cachedUser, ok := userMap[userID]; ok {
+			isAdmin = hasAnyAdminPermissionCached(cachedUser, adminPermMap[userID])
+		}
 
-		// Add active tag info
-		if tag, exists := tagMap[users[i].ID]; exists && tag != nil {
-			u["active_tag"] = gin.H{
+		entry := sanitizeUserCached(&users[i], isAdmin)
+		if perms, ok := permMap[userID]; ok {
+			entry["permissions"] = perms
+		} else {
+			entry["permissions"] = []string{}
+		}
+
+		if tag, exists := tagMap[userID]; exists && tag != nil {
+			entry["active_tag"] = gin.H{
 				"id":               tag.ID,
 				"name":             tag.Name,
 				"title":            tag.Title,
@@ -170,10 +185,10 @@ func (h *AdminHandler) ListUsers(c *gin.Context) {
 				"text_color":       tag.TextColor,
 			}
 		} else {
-			u["active_tag"] = nil
+			entry["active_tag"] = nil
 		}
 
-		items = append(items, u)
+		items = append(items, entry)
 	}
 	basichttp.OK(c, gin.H{"total": total, "items": items, "page": page, "page_size": size})
 }
@@ -182,7 +197,7 @@ func (h *AdminHandler) ListUsers(c *gin.Context) {
 func (h *AdminHandler) UpdateUserPassword(c *gin.Context) {
 	id := c.Param("id")
 	// Permission check: superadmin or MANAGE_USERS
-	if !mw.IsSuper(c) {
+	if !mw.IsSuper(c, h.db) {
 		uid, _ := c.Get(mw.CtxUserID)
 		var cnt int64
 		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_USERS").Scan(&cnt)
@@ -212,7 +227,7 @@ func (h *AdminHandler) UpdateUserPassword(c *gin.Context) {
 	}
 	// Only superadmin can modify another admin's password
 	if hasAnyAdminPermission(h.db, id) {
-		if !mw.IsSuper(c) {
+		if !mw.IsSuper(c, h.db) {
 			basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "only superadmin can modify admin password")
 			return
 		}
@@ -241,7 +256,7 @@ func (h *AdminHandler) UpdateUserPassword(c *gin.Context) {
 func (h *AdminHandler) BanUser(c *gin.Context) {
 	id := c.Param("id")
 	// Permission check: superadmin or MANAGE_USERS
-	if !mw.IsSuper(c) {
+	if !mw.IsSuper(c, h.db) {
 		uid, _ := c.Get(mw.CtxUserID)
 		var cnt int64
 		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_USERS").Scan(&cnt)
@@ -290,7 +305,7 @@ func (h *AdminHandler) BanUser(c *gin.Context) {
 // POST /api/admin/users/:id/unban (auth; MANAGE_USERS or super)
 func (h *AdminHandler) UnbanUser(c *gin.Context) {
 	id := c.Param("id")
-	if !mw.IsSuper(c) {
+	if !mw.IsSuper(c, h.db) {
 		uid, _ := c.Get(mw.CtxUserID)
 		var cnt int64
 		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_USERS").Scan(&cnt)
@@ -330,7 +345,7 @@ func (h *AdminHandler) UnbanUser(c *gin.Context) {
 // Soft delete a user to prevent future login while preserving posts/comments and profile display.
 // Also revokes all active sessions immediately.
 func (h *AdminHandler) DeleteUser(c *gin.Context) {
-	if !mw.IsSuper(c) {
+	if !mw.IsSuper(c, h.db) {
 		basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "superadmin required")
 		return
 	}
@@ -368,7 +383,7 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 // Returns totals: platform total comments, today's total comments, today's new users
 func (h *AdminHandler) MetricsOverview(c *gin.Context) {
 	// Permission: super or MANAGE_USERS
-	if !mw.IsSuper(c) {
+	if !mw.IsSuper(c, h.db) {
 		uid, _ := c.Get(mw.CtxUserID)
 		var cnt int64
 		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL", uid, "MANAGE_USERS").Scan(&cnt)
@@ -413,7 +428,7 @@ func (h *AdminHandler) MetricsOverview(c *gin.Context) {
 func (h *AdminHandler) ApprovePost(c *gin.Context) {
 	id := c.Param("id")
 	// Permission check: allow superadmin or user having the post management permission
-	if !mw.IsSuper(c) {
+	if !mw.IsSuper(c, h.db) {
 		uid, _ := c.Get(mw.CtxUserID)
 		var cnt int64
 		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL",
@@ -435,7 +450,7 @@ func (h *AdminHandler) ApprovePost(c *gin.Context) {
 // Rejects and permanently deletes the post along with its comments and images
 func (h *AdminHandler) RejectPost(c *gin.Context) {
 	id := c.Param("id")
-	if !mw.IsSuper(c) {
+	if !mw.IsSuper(c, h.db) {
 		uid, _ := c.Get(mw.CtxUserID)
 		var cnt int64
 		h.db.Raw("SELECT COUNT(1) FROM user_permissions WHERE user_id = ? AND permission = ? AND deleted_at IS NULL",
