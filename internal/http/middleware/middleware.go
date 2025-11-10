@@ -217,9 +217,7 @@ func IsSuper(c *gin.Context, db *gorm.DB) bool {
 		return false
 	}
 	uid, _ := uidVal.(string)
-	var u struct {
-		IsSuperadmin bool
-	}
+	var u model.User
 	if err := db.Select("is_superadmin").First(&u, "id = ? AND deleted_at IS NULL", uid).Error; err != nil {
 		return false
 	}
