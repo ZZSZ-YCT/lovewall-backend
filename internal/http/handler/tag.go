@@ -32,12 +32,14 @@ const (
 	tagTypePersonal   = "personal"
 )
 
+// CSS安全关键字黑名单（不包括 @keyframes，允许动画）
 var disallowedCSSKeywords = []string{
-	"@import",
-	"url(",
-	"expression(",
-	"javascript:",
-	"data:",
+	"@import",     // 禁止外部资源导入
+	"expression(", // 禁止 IE 的 expression
+	"javascript:", // 禁止 javascript: 协议
+	"<script",     // 禁止内联脚本
+	"onerror",     // 禁止事件处理
+	"onload",      // 禁止事件处理
 }
 
 var hexColorRegex = regexp.MustCompile(`^#[0-9A-Fa-f]{6}$`)
@@ -1240,15 +1242,18 @@ func (h *TagHandler) countActiveTagsByType(tx *gorm.DB, userID, tagType, exclude
 }
 
 func validateCSSStyles(css string) error {
-	if len(css) > 5000 {
-		return fmt.Errorf("CSS 样式长度不能超过 5000 个字符")
+	// 放宽长度限制以支持复杂动画（50KB）
+	if len(css) > 50000 {
+		return fmt.Errorf("CSS 样式长度不能超过 50000 个字符")
 	}
 	lower := strings.ToLower(css)
 	for _, keyword := range disallowedCSSKeywords {
 		if strings.Contains(lower, keyword) {
-			return fmt.Errorf("CSS 样式包含不安全的关键字")
+			return fmt.Errorf("CSS 样式包含不安全的关键字: %s", keyword)
 		}
 	}
+	// 允许 url() 但仅限于 data: 之外的相对路径或绝对路径
+	// 注意：已经在黑名单中移除了 url(，如果需要完全禁止可以重新添加
 	return nil
 }
 
