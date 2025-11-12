@@ -166,7 +166,10 @@ func (h *TagHandler) ListTags(c *gin.Context) {
 
 	var total int64
 	var items []model.Tag
-	q := h.db.Model(&model.Tag{}).Where("deleted_at IS NULL")
+	// 只显示集体 Tag，个人 Tag 不在公开列表中展示
+	// 使用与其他查询一致的逻辑：LOWER(COALESCE(NULLIF(tag_type, ''), 'collective'))
+	q := h.db.Model(&model.Tag{}).Where("deleted_at IS NULL").
+		Where("LOWER(COALESCE(NULLIF(tag_type, ''), ?)) = ?", tagTypeCollective, tagTypeCollective)
 
 	// Filter by active status if specified
 	if active := c.Query("active"); active != "" {
@@ -632,14 +635,49 @@ func (h *TagHandler) RemoveUserTagFromUser(c *gin.Context) {
 	userID := c.Param("id")
 	tagID := c.Param("tag_id")
 	var ut model.UserTag
-	if err := h.db.First(&ut, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, tagID).Error; err != nil {
+	if err := h.db.Preload("Tag").First(&ut, "user_id = ? AND tag_id = ? AND deleted_at IS NULL", userID, tagID).Error; err != nil {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user tag not found")
 		return
 	}
+
+	// 记录 tag 类型用于后续检查
+	tagType := sanitizeTagType(ut.Tag.TagType)
+
 	if err := h.db.Unscoped().Delete(&ut).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
 		return
 	}
+
+	// 如果是个人 Tag，检查是否还有其他用户拥有该 Tag
+	if tagType == tagTypePersonal {
+		var remainingCount int64
+		if err := h.db.Model(&model.UserTag{}).Where("tag_id = ? AND deleted_at IS NULL", tagID).Count(&remainingCount).Error; err != nil {
+			// 查询失败，记录错误但不阻塞主流程
+			if uid, ok := c.Get(mw.CtxUserID); ok {
+				if uidStr, ok2 := uid.(string); ok2 {
+					service.LogOperation(h.db, uidStr, "auto_delete_personal_tag_failed", "tag", tagID, map[string]any{"reason": "count_error", "error": err.Error()})
+				}
+			}
+		} else if remainingCount == 0 {
+			// 如果没有任何用户拥有该 Tag，自动删除 Tag 本身
+			if err := h.db.Delete(&model.Tag{}, "id = ?", tagID).Error; err != nil {
+				// 删除失败，记录错误
+				if uid, ok := c.Get(mw.CtxUserID); ok {
+					if uidStr, ok2 := uid.(string); ok2 {
+						service.LogOperation(h.db, uidStr, "auto_delete_personal_tag_failed", "tag", tagID, map[string]any{"reason": "delete_error", "error": err.Error()})
+					}
+				}
+			} else {
+				// 删除成功，记录操作
+				if uid, ok := c.Get(mw.CtxUserID); ok {
+					if uidStr, ok2 := uid.(string); ok2 {
+						service.LogOperation(h.db, uidStr, "auto_delete_personal_tag", "tag", tagID, map[string]any{"reason": "no_users"})
+					}
+				}
+			}
+		}
+	}
+
 	if uid, ok := c.Get(mw.CtxUserID); ok {
 		if uidStr, ok2 := uid.(string); ok2 {
 			service.LogOperation(h.db, uidStr, "remove_user_tag", "user", userID, map[string]any{"tag_id": tagID})

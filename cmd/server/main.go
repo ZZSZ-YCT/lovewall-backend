@@ -47,8 +47,8 @@ func main() {
 	// Start heartbeat monitor for user online status tracking
 	service.StartHeartbeatMonitor(database)
 
-	// Start async writer for request logs to reduce SQLite write contention
-	mw.StartRequestLogWriter(database)
+	// REMOVED: Request log writer - this was useless garbage that bloated the database
+	// mw.StartRequestLogWriter(database)
 
 	// Auto-create admin user if configured and no users exist
 	if cfg.AdminInitUser != "" && cfg.AdminInitPass != "" {
@@ -78,7 +78,8 @@ func main() {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(mw.RequestLogger())
-	r.Use(mw.RequestDBLogger(database))
+	// REMOVED: RequestDBLogger - this writes to the useless request_logs table
+	// r.Use(mw.RequestDBLogger(database))
 	r.Use(mw.RateLimit(cfg.RateLimitRPS, cfg.RateLimitBurst))
 	r.Use(mw.CORS())
 	// Security headers (lightweight)

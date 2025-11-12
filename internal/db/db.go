@@ -63,6 +63,12 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 }
 
 func AutoMigrate(db *gorm.DB) error {
+	// Drop the garbage request_logs table if it exists
+	// This table serves no business purpose and only bloats the database
+	if err := dropRequestLogsTable(db); err != nil {
+		return fmt.Errorf("drop request_logs table: %w", err)
+	}
+
 	if err := db.AutoMigrate(
 		&model.User{},
 		&model.ExternalIdentity{},
@@ -74,7 +80,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&model.Tag{},
 		&model.RedemptionCode{},
 		&model.UserTag{},
-		&model.RequestLog{},
+		// &model.RequestLog{}, // REMOVED: This is useless garbage that bloats the DB
 		&model.SubmissionLog{},
 		&model.OperationLog{},
 		&model.UserSession{},
@@ -441,6 +447,47 @@ func migratePostCommentFeatures(db *gorm.DB) error {
 		AND deleted_at IS NULL
 	`).Error; err != nil {
 		return fmt.Errorf("clean avatar_url: %w", err)
+	}
+
+	return nil
+}
+
+// dropRequestLogsTable drops the request_logs table if it exists.
+// This table is useless garbage that stores every HTTP request and bloats the database.
+// Business value: ZERO. The only logs we need are submission logs and operation logs.
+func dropRequestLogsTable(db *gorm.DB) error {
+	// Check if request_logs table exists
+	var tableExists int
+	if err := db.Raw("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='request_logs'").Scan(&tableExists).Error; err != nil {
+		return fmt.Errorf("check request_logs table existence: %w", err)
+	}
+
+	if tableExists > 0 {
+		log.Println("Detected garbage request_logs table, dropping it to reclaim space...")
+
+		// Drop the table
+		if err := db.Exec("DROP TABLE request_logs").Error; err != nil {
+			return fmt.Errorf("drop request_logs table: %w", err)
+		}
+		log.Println("request_logs table dropped successfully.")
+
+		// CRITICAL: VACUUM to actually reclaim disk space
+		// Without VACUUM, SQLite just marks the pages as reusable but doesn't shrink the file
+		log.Println("Running VACUUM to reclaim disk space (this may take a while)...")
+		// Best-effort: don't block startup if VACUUM fails (e.g., database is locked)
+		if err := db.Exec("VACUUM").Error; err != nil {
+			log.Printf("WARNING: VACUUM failed (database may still be bloated): %v", err)
+		} else {
+			log.Println("VACUUM completed successfully.")
+
+			// In WAL mode, also checkpoint and truncate the WAL file
+			log.Println("Checkpointing WAL to reclaim WAL file space...")
+			if err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)").Error; err != nil {
+				log.Printf("WARNING: WAL checkpoint failed: %v", err)
+			} else {
+				log.Println("WAL checkpoint completed. Database file size should be much smaller now.")
+			}
+		}
 	}
 
 	return nil

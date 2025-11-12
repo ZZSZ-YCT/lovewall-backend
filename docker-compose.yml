@@ -28,7 +28,7 @@ services:
   # 主应用服务
   love-wall:
     build: .
-    image: lovewall:latest
+#    image: mycbxzd/lovewall-backend:0.1.2.1
     container_name: love-wall
     ports:
       - "8124:8000"
