@@ -112,7 +112,7 @@ func generateJWTSecret() string {
 
 func Load() *Config {
 	jwtSecret := getenv("JWT_SECRET", "")
-	if jwtSecret == "" || jwtSecret == "please_change_me" {
+	if jwtSecret == "" || jwtSecret == "change_me" {
 		jwtSecret = generateJWTSecret()
 	}
 
