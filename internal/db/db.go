@@ -69,6 +69,11 @@ func AutoMigrate(db *gorm.DB) error {
 		return fmt.Errorf("drop request_logs table: %w", err)
 	}
 
+	// Migrate announcements table from v3.x (title-based) to v4.0 (path-based)
+	if err := dropOldAnnouncementsTable(db); err != nil {
+		return fmt.Errorf("migrate announcements table to v4.0: %w", err)
+	}
+
 	if err := db.AutoMigrate(
 		&model.User{},
 		&model.ExternalIdentity{},
@@ -487,6 +492,70 @@ func dropRequestLogsTable(db *gorm.DB) error {
 			} else {
 				log.Println("WAL checkpoint completed. Database file size should be much smaller now.")
 			}
+		}
+	}
+
+	return nil
+}
+
+// dropOldAnnouncementsTable removes the old title-based announcements table
+// and prepares for the new path-based schema (v4.0)
+func dropOldAnnouncementsTable(db *gorm.DB) error {
+	// Check if announcements table exists with old schema (has 'title' column)
+	var columns []struct {
+		Name string
+	}
+
+	// First check if table exists
+	var tableExists int
+	if err := db.Raw("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='announcements'").Scan(&tableExists).Error; err != nil {
+		return fmt.Errorf("check announcements table existence: %w", err)
+	}
+
+	if tableExists == 0 {
+		// Table doesn't exist, nothing to do
+		return nil
+	}
+
+	// Check if it has the old 'title' column
+	if err := db.Raw("PRAGMA table_info(announcements)").Scan(&columns).Error; err != nil {
+		return fmt.Errorf("failed to check announcements table schema: %w", err)
+	}
+
+	hasTitleColumn := false
+	hasPathColumn := false
+	for _, col := range columns {
+		if col.Name == "title" {
+			hasTitleColumn = true
+		}
+		if col.Name == "path" {
+			hasPathColumn = true
+		}
+	}
+
+	// If it has 'path' but not 'title', it's already the new schema
+	if hasPathColumn && !hasTitleColumn {
+		log.Println("Announcements table already migrated to v4.0 (path-based), skipping drop.")
+		return nil
+	}
+
+	// If it has 'title' column, it's the old schema - drop it
+	if hasTitleColumn {
+		log.Println("Detected old title-based announcements table (v3.x), migrating to v4.0...")
+		log.Println("Dropping old announcements table (data will be lost, but table was rarely used)...")
+
+		// Drop the old table
+		if err := db.Exec("DROP TABLE announcements").Error; err != nil {
+			return fmt.Errorf("drop old announcements table: %w", err)
+		}
+		log.Println("Old announcements table dropped successfully.")
+
+		// VACUUM to reclaim space (best-effort)
+		log.Println("Running VACUUM to reclaim disk space...")
+		if err := db.Exec("VACUUM").Error; err != nil {
+			log.Printf("WARNING: VACUUM failed: %v", err)
+		} else {
+			log.Println("VACUUM completed successfully.")
 		}
 	}
 

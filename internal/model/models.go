@@ -125,7 +125,7 @@ type Comment struct {
 
 type Announcement struct {
 	BaseModel
-	Title    string  `gorm:"not null" json:"title"`
+	Path     string  `gorm:"not null;uniqueIndex" json:"path"`
 	Content  string  `gorm:"not null" json:"content"`
 	IsActive bool    `gorm:"not null;default:true;index" json:"is_active"`
 	Metadata *string `json:"metadata,omitempty"`

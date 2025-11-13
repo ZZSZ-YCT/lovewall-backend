@@ -214,13 +214,14 @@ func (h *PostHandler) ListPosts(c *gin.Context) {
 	q := h.db.Model(&model.Post{}).Where("status = 0 AND deleted_at IS NULL")
 
 	if v := c.Query("featured"); v == "true" {
-		q = q.Where("is_featured = 1")
+		q = q.Where("is_featured = ?", true)
 	}
 	if v := c.Query("pinned"); v == "true" {
-		q = q.Where("is_pinned = 1")
+		q = q.Where("is_pinned = ?", true)
 	}
 	q.Count(&total)
-	q = q.Order("created_at DESC").Offset((page - 1) * size).Limit(size)
+	// Sort by priority: pinned+featured > pinned > featured > normal, then by time
+	q = q.Order("is_pinned DESC, is_featured DESC, created_at DESC").Offset((page - 1) * size).Limit(size)
 	if err := q.Find(&items).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
 		return
@@ -248,6 +249,7 @@ func (h *PostHandler) ListByUser(c *gin.Context) {
 	q := h.db.Model(&model.Post{}).
 		Where("author_id = ? AND status = 0 AND deleted_at IS NULL", userID)
 	q.Count(&total)
+	// User profile shows latest posts first (no priority sorting)
 	if err := q.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
 		return
@@ -1000,15 +1002,16 @@ func (h *PostHandler) ListModeration(c *gin.Context) {
 		dbq = dbq.Where("author_id = ?", v)
 	}
 	if v := c.Query("featured"); v == "true" {
-		dbq = dbq.Where("is_featured = 1")
+		dbq = dbq.Where("is_featured = ?", true)
 	}
 	if v := c.Query("pinned"); v == "true" {
-		dbq = dbq.Where("is_pinned = 1")
+		dbq = dbq.Where("is_pinned = ?", true)
 	}
 
 	var total int64
 	dbq.Count(&total)
 	var items []model.Post
+	// Moderation queue shows latest activity first (no priority sorting)
 	if err := dbq.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
 		return

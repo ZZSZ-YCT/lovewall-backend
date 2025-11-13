@@ -127,6 +127,7 @@ func main() {
 	api.GET("/posts/:id/stats", postH.Stats)
 	api.GET("/posts/:id/comments", cmtH.ListForPost)
 	api.GET("/announcements", annH.List)
+	api.GET("/announcements/by-path/*path", annH.GetByPath)
 	api.GET("/tags", tagH.ListTags)
 
 	authed := api.Group("")
