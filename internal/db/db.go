@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gorm.io/driver/sqlite"
@@ -500,16 +501,20 @@ func dropRequestLogsTable(db *gorm.DB) error {
 
 // dropOldAnnouncementsTable removes the old title-based announcements table
 // and prepares for the new path-based schema (v4.0)
+// NOTE: This function uses SQLite-specific queries (sqlite_master, PRAGMA)
 func dropOldAnnouncementsTable(db *gorm.DB) error {
 	// Check if announcements table exists with old schema (has 'title' column)
 	var columns []struct {
 		Name string
 	}
 
-	// First check if table exists
+	// First check if table exists (SQLite-specific query)
 	var tableExists int
 	if err := db.Raw("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='announcements'").Scan(&tableExists).Error; err != nil {
-		return fmt.Errorf("check announcements table existence: %w", err)
+		// If this query fails (e.g., on non-SQLite databases), skip migration gracefully
+		log.Printf("WARNING: Failed to check announcements table (possibly non-SQLite database): %v", err)
+		log.Println("Skipping announcements migration. If using SQLite, please check manually.")
+		return nil
 	}
 
 	if tableExists == 0 {
@@ -517,18 +522,23 @@ func dropOldAnnouncementsTable(db *gorm.DB) error {
 		return nil
 	}
 
-	// Check if it has the old 'title' column
+	// Check if it has the old 'title' column (SQLite-specific PRAGMA)
 	if err := db.Raw("PRAGMA table_info(announcements)").Scan(&columns).Error; err != nil {
-		return fmt.Errorf("failed to check announcements table schema: %w", err)
+		// If PRAGMA fails (e.g., on non-SQLite databases), skip migration gracefully
+		log.Printf("WARNING: Failed to read announcements table schema (possibly non-SQLite database): %v", err)
+		log.Println("Skipping announcements migration. If using SQLite, please check manually.")
+		return nil
 	}
 
 	hasTitleColumn := false
 	hasPathColumn := false
 	for _, col := range columns {
-		if col.Name == "title" {
+		// Case-insensitive comparison to handle Title, TITLE, title, etc.
+		colNameLower := strings.ToLower(col.Name)
+		if colNameLower == "title" {
 			hasTitleColumn = true
 		}
-		if col.Name == "path" {
+		if colNameLower == "path" {
 			hasPathColumn = true
 		}
 	}
@@ -556,6 +566,14 @@ func dropOldAnnouncementsTable(db *gorm.DB) error {
 			log.Printf("WARNING: VACUUM failed: %v", err)
 		} else {
 			log.Println("VACUUM completed successfully.")
+
+			// In WAL mode, also checkpoint and truncate the WAL file
+			log.Println("Checkpointing WAL to reclaim WAL file space...")
+			if err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)").Error; err != nil {
+				log.Printf("WARNING: WAL checkpoint failed: %v", err)
+			} else {
+				log.Println("WAL checkpoint completed. Database file size should be reduced.")
+			}
 		}
 	}
 

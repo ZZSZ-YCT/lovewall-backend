@@ -34,22 +34,46 @@ import (
 )
 
 type AuthHandler struct {
-	db    *gorm.DB
-	cfg   *config.Config
-	cache service.Cache
+	db         *gorm.DB
+	cfg        *config.Config
+	cache      service.Cache
+	captchaSvc *service.CaptchaService
 }
 
-func NewAuthHandler(db *gorm.DB, cfg *config.Config, cache service.Cache) *AuthHandler {
-	return &AuthHandler{db: db, cfg: cfg, cache: cache}
+func NewAuthHandler(db *gorm.DB, cfg *config.Config, cache service.Cache, captchaSvc *service.CaptchaService) *AuthHandler {
+	return &AuthHandler{db: db, cfg: cfg, cache: cache, captchaSvc: captchaSvc}
+}
+
+func (h *AuthHandler) ensureCaptcha(c *gin.Context, captchaID string, payload service.VerifyPayload) bool {
+	if h.captchaSvc == nil {
+		zap.L().Error("captcha service not initialized")
+		basichttp.Fail(c, http.StatusInternalServerError, "CAPTCHA_FAILED", "验证码校验失败")
+		return false
+	}
+
+	if err := h.captchaSvc.Verify(captchaID, payload); err != nil {
+		switch {
+		case errors.Is(err, service.ErrCaptchaRequired):
+			basichttp.Fail(c, http.StatusBadRequest, "CAPTCHA_REQUIRED", "验证码不能为空")
+		case errors.Is(err, service.ErrCaptchaInvalid):
+			basichttp.Fail(c, http.StatusBadRequest, "CAPTCHA_INVALID", "验证码无效或已过期")
+		case errors.Is(err, service.ErrCaptchaFailed):
+			basichttp.Fail(c, http.StatusBadRequest, "CAPTCHA_FAILED", "验证码校验失败")
+		default:
+			zap.L().Error("captcha verification error", zap.Error(err))
+			basichttp.Fail(c, http.StatusInternalServerError, "CAPTCHA_FAILED", "验证码校验失败")
+		}
+		return false
+	}
+	return true
 }
 
 type RegisterRequest struct {
-	Username      string `json:"username" binding:"required,min=3,max=32"`
-	Password      string `json:"password" binding:"required,min=6,max=64"`
-	LotNumber     string `json:"lot_number"`
-	CaptchaOutput string `json:"captcha_output"`
-	PassToken     string `json:"pass_token"`
-	GenTime       string `json:"gen_time"`
+	Username    string             `json:"username" binding:"required,min=3,max=32"`
+	Password    string             `json:"password" binding:"required,min=6,max=64"`
+	CaptchaID   string             `json:"captcha_id" binding:"required"`
+	CaptchaData json.RawMessage    `json:"captcha_data"`
+	Dots        []service.DotInput `json:"dots"`
 }
 
 func (h *AuthHandler) Register(c *gin.Context) {
@@ -58,28 +82,8 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid payload")
 		return
 	}
-
-	// Verify Geetest CAPTCHA if configured
-	validator := service.NewGeetestValidator(h.cfg.GeetestCaptchaID, h.cfg.GeetestCaptchaKey)
-	if validator.IsEnabled() {
-		// Validate all CAPTCHA fields are present
-		if req.LotNumber == "" || req.CaptchaOutput == "" || req.PassToken == "" || req.GenTime == "" {
-			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "captcha validation required")
-			return
-		}
-
-		// Verify CAPTCHA with Geetest API
-		geetestReq := &service.GeetestValidateRequest{
-			LotNumber:     req.LotNumber,
-			CaptchaOutput: req.CaptchaOutput,
-			PassToken:     req.PassToken,
-			GenTime:       req.GenTime,
-		}
-		valid, err := validator.Validate(geetestReq)
-		if err != nil || !valid {
-			basichttp.Fail(c, http.StatusUnauthorized, "CAPTCHA_FAILED", "captcha verification failed")
-			return
-		}
+	if !h.ensureCaptcha(c, req.CaptchaID, service.VerifyPayload{Raw: req.CaptchaData, Dots: req.Dots}) {
+		return
 	}
 
 	req.Username = strings.TrimSpace(req.Username)
@@ -141,14 +145,20 @@ func (h *AuthHandler) Register(c *gin.Context) {
 }
 
 type LoginRequest struct {
-	Username string `json:"username" binding:"required"`
-	Password string `json:"password" binding:"required"`
+	Username    string             `json:"username" binding:"required"`
+	Password    string             `json:"password" binding:"required"`
+	CaptchaID   string             `json:"captcha_id" binding:"required"`
+	CaptchaData json.RawMessage    `json:"captcha_data"`
+	Dots        []service.DotInput `json:"dots"`
 }
 
 func (h *AuthHandler) Login(c *gin.Context) {
 	var req LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid payload")
+		return
+	}
+	if !h.ensureCaptcha(c, req.CaptchaID, service.VerifyPayload{Raw: req.CaptchaData, Dots: req.Dots}) {
 		return
 	}
 	var u model.User

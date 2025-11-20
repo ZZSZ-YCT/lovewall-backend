@@ -113,15 +113,22 @@ func (h *AnnouncementHandler) AdminList(c *gin.Context) {
 	basichttp.OK(c, items)
 }
 
-type upsertBody struct {
+type createBody struct {
 	Path     string  `json:"path" binding:"required"`
 	Content  string  `json:"content" binding:"required"`
 	IsActive *bool   `json:"is_active"`
 	Metadata *string `json:"metadata"`
 }
 
+type updateBody struct {
+	Path     string  `json:"path"`    // Optional for partial updates
+	Content  string  `json:"content"` // Optional for partial updates
+	IsActive *bool   `json:"is_active"`
+	Metadata *string `json:"metadata"`
+}
+
 func (h *AnnouncementHandler) Create(c *gin.Context) {
-	var b upsertBody
+	var b createBody
 	if err := c.ShouldBindJSON(&b); err != nil {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid body")
 		return
@@ -134,7 +141,11 @@ func (h *AnnouncementHandler) Create(c *gin.Context) {
 		return
 	}
 
-	a := &model.Announcement{Path: normalizedPath, Content: b.Content}
+	a := &model.Announcement{
+		Path:     normalizedPath,
+		Content:  b.Content,
+		IsActive: true, // Default to active unless explicitly set to false
+	}
 	if b.IsActive != nil {
 		a.IsActive = *b.IsActive
 	}
@@ -160,7 +171,7 @@ func (h *AnnouncementHandler) Create(c *gin.Context) {
 
 func (h *AnnouncementHandler) Update(c *gin.Context) {
 	id := c.Param("id")
-	var b upsertBody
+	var b updateBody
 	if err := c.ShouldBindJSON(&b); err != nil {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid body")
 		return
@@ -192,9 +203,22 @@ func (h *AnnouncementHandler) Update(c *gin.Context) {
 		return
 	}
 
-	if err := h.db.Model(&model.Announcement{}).Where("id = ? AND deleted_at IS NULL", id).Updates(updates).Error; err != nil {
+	// Check if announcement exists BEFORE updating (fix for RowsAffected false 404)
+	var existsCheck model.Announcement
+	if err := h.db.Select("id").First(&existsCheck, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "announcement not found")
+			return
+		}
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "existence check failed")
+		return
+	}
+
+	// Now perform the update (RowsAffected may be 0 for idempotent updates, which is OK)
+	result := h.db.Model(&model.Announcement{}).Where("id = ? AND deleted_at IS NULL", id).Updates(updates)
+	if result.Error != nil {
 		// Check for unique constraint violation (cross-database compatible)
-		if isUniqueConstraintError(err) {
+		if isUniqueConstraintError(result.Error) {
 			basichttp.Fail(c, http.StatusConflict, "PATH_EXISTS", "announcement with this path already exists")
 			return
 		}
@@ -202,17 +226,20 @@ func (h *AnnouncementHandler) Update(c *gin.Context) {
 		return
 	}
 
+	// Fetch updated announcement
 	var a model.Announcement
-	if err := h.db.First(&a, "id = ?", id).Error; err == nil {
-		if uid, ok := c.Get(mw.CtxUserID); ok {
-			if uidStr, ok2 := uid.(string); ok2 {
-				service.LogOperation(h.db, uidStr, "update_announcement", "announcement", id, nil)
-			}
-		}
-		basichttp.OK(c, a)
-	} else {
-		basichttp.OK(c, gin.H{"ok": true})
+	if err := h.db.First(&a, "id = ?", id).Error; err != nil {
+		// Fetch failed after successful update - return 500 instead of 200
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "fetch after update failed")
+		return
 	}
+
+	if uid, ok := c.Get(mw.CtxUserID); ok {
+		if uidStr, ok2 := uid.(string); ok2 {
+			service.LogOperation(h.db, uidStr, "update_announcement", "announcement", id, nil)
+		}
+	}
+	basichttp.OK(c, a)
 }
 
 func (h *AnnouncementHandler) Delete(c *gin.Context) {
@@ -223,8 +250,8 @@ func (h *AnnouncementHandler) Delete(c *gin.Context) {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "announcement not found")
 		return
 	}
-	// Hard delete
-	if err := h.db.Unscoped().Delete(&a).Error; err != nil {
+	// Soft delete (consistent with other models)
+	if err := h.db.Delete(&a).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
 		return
 	}

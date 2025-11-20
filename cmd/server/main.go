@@ -41,6 +41,11 @@ func main() {
 
 	cacheSvc := service.NewCacheManager(cfg)
 
+	captchaSvc, err := service.NewCaptchaService(cfg)
+	if err != nil {
+		zap.L().Fatal("failed to init captcha service", zap.Error(err))
+	}
+
 	// Start moderation worker (async AI review)
 	service.StartModerationWorker(database, service.NewConfigAdapter(cfg.AIBaseURL, cfg.AIAPIKey, cfg.AIModel))
 
@@ -81,7 +86,7 @@ func main() {
 	// REMOVED: RequestDBLogger - this writes to the useless request_logs table
 	// r.Use(mw.RequestDBLogger(database))
 	r.Use(mw.RateLimit(cfg.RateLimitRPS, cfg.RateLimitBurst))
-	r.Use(mw.CORS())
+	r.Use(mw.CORS(cfg.CORSAllowedOrigins))
 	// Security headers (lightweight)
 	r.Use(func(c *gin.Context) {
 		c.Writer.Header().Set("X-Content-Type-Options", "nosniff")
@@ -96,7 +101,8 @@ func main() {
 
 	api := r.Group("/api")
 
-	authH := handler.NewAuthHandler(database, cfg, cacheSvc)
+	captchaH := handler.NewCaptchaHandler(captchaSvc)
+	authH := handler.NewAuthHandler(database, cfg, cacheSvc, captchaSvc)
 	postH := handler.NewPostHandler(database, cfg)
 	annH := handler.NewAnnouncementHandler(database, cfg)
 	cmtH := handler.NewCommentHandler(database, cfg)
@@ -106,6 +112,7 @@ func main() {
 	notifyH := handler.NewNotifyHandler(database, cfg)
 	onlineH := handler.NewOnlineHandler(database, cfg)
 
+	api.GET("/captcha/generate", captchaH.Generate)
 	api.POST("/register", authH.Register)
 	api.POST("/login", authH.Login)
 	api.POST("/logout", authH.Logout)

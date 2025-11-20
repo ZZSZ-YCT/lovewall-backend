@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -41,9 +42,14 @@ type Config struct {
 	QuotaCommentsPerIPPerHour   int // default 10
 	MaxPostChars                int // default 2000
 	MaxCommentChars             int // default 500
-	// Geetest captcha
-	GeetestCaptchaID  string // Geetest public key (captcha_id)
-	GeetestCaptchaKey string // Geetest private key (captcha_key)
+	// Captcha configuration
+	CaptchaEnabled    bool
+	CaptchaType       string
+	CaptchaMinChars   int
+	CaptchaMaxChars   int
+	CaptchaMinVerify  int
+	CaptchaMaxVerify  int
+	CaptchaTTLSeconds int
 	// Cache / Redis
 	RedisEnabled           bool
 	RedisAddr              string
@@ -57,6 +63,8 @@ type Config struct {
 	CacheUserTTL           time.Duration
 	CacheUserListTTL       time.Duration
 	CachePerfWarnThreshold time.Duration
+	// CORS
+	CORSAllowedOrigins []string // Whitelist of allowed origins for CORS
 }
 
 func getenv(key, def string) string {
@@ -116,7 +124,7 @@ func Load() *Config {
 		jwtSecret = generateJWTSecret()
 	}
 
-	uploadDir := getenv("UPLOAD_DIR", "./data/uploads")
+	uploadDir := getenv("UPLOAD_DIR", filepath.Join(".", "data", "uploads"))
 
 	// Create upload directory if it doesn't exist
 	if uploadDir != "" {
@@ -150,6 +158,36 @@ func Load() *Config {
 		cachePerfWarn = 200 * time.Millisecond
 	}
 
+	captchaEnabled := getbool("CAPTCHA_ENABLED", true)
+	if !captchaEnabled {
+		// Captcha is mandatory for the backend; ignore attempts to disable it.
+		captchaEnabled = true
+	}
+	captchaType := strings.ToLower(getenv("CAPTCHA_TYPE", "random"))
+	if captchaType != "click" && captchaType != "rotate" && captchaType != "random" {
+		captchaType = "random"
+	}
+	captchaMinChars := getinti("CAPTCHA_MIN_CHARS", 4)
+	if captchaMinChars <= 0 {
+		captchaMinChars = 4
+	}
+	captchaMaxChars := getinti("CAPTCHA_MAX_CHARS", 6)
+	if captchaMaxChars < captchaMinChars {
+		captchaMaxChars = captchaMinChars
+	}
+	captchaMinVerify := getinti("CAPTCHA_MIN_VERIFY", 2)
+	if captchaMinVerify <= 0 {
+		captchaMinVerify = 2
+	}
+	captchaMaxVerify := getinti("CAPTCHA_MAX_VERIFY", 4)
+	if captchaMaxVerify < captchaMinVerify {
+		captchaMaxVerify = captchaMinVerify
+	}
+	captchaTTL := getinti("CAPTCHA_TTL_SECONDS", 60)
+	if captchaTTL <= 0 {
+		captchaTTL = 60
+	}
+
 	return &Config{
 		Port:                        getinti("PORT", 8000),
 		DBDriver:                    getenv("DB_DRIVER", "sqlite"),
@@ -180,8 +218,13 @@ func Load() *Config {
 		QuotaCommentsPerIPPerHour:   getinti("QUOTA_COMMENTS_PER_IP_PER_HOUR", 10),
 		MaxPostChars:                getinti("MAX_POST_CHARS", 2000),
 		MaxCommentChars:             getinti("MAX_COMMENT_CHARS", 500),
-		GeetestCaptchaID:            getenv("GEETEST_CAPTCHA_ID", ""),
-		GeetestCaptchaKey:           getenv("GEETEST_CAPTCHA_KEY", ""),
+		CaptchaEnabled:              captchaEnabled,
+		CaptchaType:                 captchaType,
+		CaptchaMinChars:             captchaMinChars,
+		CaptchaMaxChars:             captchaMaxChars,
+		CaptchaMinVerify:            captchaMinVerify,
+		CaptchaMaxVerify:            captchaMaxVerify,
+		CaptchaTTLSeconds:           captchaTTL,
 		RedisEnabled:                getbool("REDIS_ENABLED", false),
 		RedisAddr:                   getenv("REDIS_ADDR", "127.0.0.1:6379"),
 		RedisPassword:               getenv("REDIS_PASSWORD", ""),
@@ -194,5 +237,30 @@ func Load() *Config {
 		CacheUserTTL:                cacheUserTTL,
 		CacheUserListTTL:            cacheUserListTTL,
 		CachePerfWarnThreshold:      cachePerfWarn,
+		CORSAllowedOrigins:          parseCORSOrigins(getenv("CORS_ALLOWED_ORIGINS", "*")),
 	}
+}
+
+// parseCORSOrigins parses the CORS_ALLOWED_ORIGINS environment variable
+// Format: comma-separated list of origins, or "*" for all origins
+// Example: "https://example.com,https://app.example.com"
+func parseCORSOrigins(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "*" {
+		return []string{"*"}
+	}
+
+	origins := strings.Split(s, ",")
+	result := make([]string, 0, len(origins))
+	for _, origin := range origins {
+		origin = strings.TrimSpace(origin)
+		if origin != "" {
+			result = append(result, origin)
+		}
+	}
+
+	if len(result) == 0 {
+		return []string{"*"}
+	}
+	return result
 }

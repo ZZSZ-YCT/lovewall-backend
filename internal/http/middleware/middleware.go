@@ -248,42 +248,87 @@ func RequirePerm(db *gorm.DB, perm string) gin.HandlerFunc {
 	}
 }
 
-func CORS() gin.HandlerFunc {
+func CORS(allowedOrigins []string) gin.HandlerFunc {
+	// Build a set for fast origin lookup
+	allowAll := false
+	originSet := make(map[string]bool)
+
+	for _, origin := range allowedOrigins {
+		if origin == "*" {
+			allowAll = true
+			break
+		}
+		originSet[origin] = true
+	}
+
 	return func(c *gin.Context) {
 		origin := c.GetHeader("Origin")
-		// Allow all origins; when credentials are used, echo the specific Origin.
-		if strings.TrimSpace(origin) != "" {
-			c.Header("Access-Control-Allow-Origin", origin)
-			c.Header("Vary", "Origin")
-			c.Header("Access-Control-Allow-Credentials", "true")
+
+		// Determine if this origin is allowed
+		originAllowed := false
+		if allowAll {
+			originAllowed = true
+		} else if strings.TrimSpace(origin) != "" && originSet[origin] {
+			originAllowed = true
+		}
+
+		// Set CORS headers only for allowed origins
+		if originAllowed {
+			if allowAll && strings.TrimSpace(origin) != "" {
+				// Echo the origin for wildcard mode
+				c.Header("Access-Control-Allow-Origin", origin)
+				c.Header("Vary", "Origin")
+			} else if allowAll {
+				// No origin header, use wildcard
+				c.Header("Access-Control-Allow-Origin", "*")
+			} else {
+				// Whitelist mode: echo the specific allowed origin
+				c.Header("Access-Control-Allow-Origin", origin)
+				c.Header("Vary", "Origin")
+			}
+
+			// Only allow credentials for non-wildcard origins
+			if !allowAll || strings.TrimSpace(origin) != "" {
+				c.Header("Access-Control-Allow-Credentials", "true")
+			}
+
+			// Allow all requested headers
+			if reqHdr := c.GetHeader("Access-Control-Request-Headers"); strings.TrimSpace(reqHdr) != "" {
+				c.Header("Access-Control-Allow-Headers", reqHdr)
+				c.Header("Vary", "Access-Control-Request-Headers")
+			} else {
+				c.Header("Access-Control-Allow-Headers", "*")
+			}
+
+			// Allow requested method or a broad default set
+			if reqMethod := c.GetHeader("Access-Control-Request-Method"); strings.TrimSpace(reqMethod) != "" {
+				c.Header("Access-Control-Allow-Methods", reqMethod)
+				c.Header("Vary", "Access-Control-Request-Method")
+			} else {
+				c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD")
+			}
+
+			// Expose all headers to the client where supported
+			c.Header("Access-Control-Expose-Headers", "*")
+			c.Header("Access-Control-Max-Age", "86400")
+
+			// CRITICAL: Prevent CDN/proxy caching of CORS headers with varying origins
+			c.Header("Cache-Control", "no-store, must-revalidate")
+
+			if c.Request.Method == http.MethodOptions {
+				c.AbortWithStatus(http.StatusNoContent)
+				return
+			}
 		} else {
-			c.Header("Access-Control-Allow-Origin", "*")
+			// Origin not allowed - reject preflight explicitly
+			if c.Request.Method == http.MethodOptions {
+				c.AbortWithStatus(http.StatusForbidden)
+				return
+			}
+			// For actual requests, let it through but without CORS headers
+			// (browser will block the response)
 		}
 
-		// Allow all requested headers; fallback to wildcard
-		if reqHdr := c.GetHeader("Access-Control-Request-Headers"); strings.TrimSpace(reqHdr) != "" {
-			c.Header("Access-Control-Allow-Headers", reqHdr)
-			c.Header("Vary", "Access-Control-Request-Headers")
-		} else {
-			c.Header("Access-Control-Allow-Headers", "*")
-		}
-
-		// Allow requested method or a broad default set
-		if reqMethod := c.GetHeader("Access-Control-Request-Method"); strings.TrimSpace(reqMethod) != "" {
-			c.Header("Access-Control-Allow-Methods", reqMethod)
-			c.Header("Vary", "Access-Control-Request-Method")
-		} else {
-			c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD")
-		}
-
-		// Expose all headers to the client where supported
-		c.Header("Access-Control-Expose-Headers", "*")
-		c.Header("Access-Control-Max-Age", "86400")
-
-		if c.Request.Method == http.MethodOptions {
-			c.AbortWithStatus(http.StatusNoContent)
-			return
-		}
 		c.Next()
 	}
 }
