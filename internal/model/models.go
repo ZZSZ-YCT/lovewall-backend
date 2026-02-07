@@ -235,40 +235,6 @@ type Notification struct {
 	Metadata *string `json:"metadata,omitempty"`
 }
 
-// UserMFA stores per-user MFA factors such as TOTP.
-type UserMFA struct {
-	BaseModel
-	UserID     string     `gorm:"index;not null" json:"user_id"`
-	Type       string     `gorm:"index;not null" json:"type"`
-	Secret     string     `json:"-"`
-	IsVerified bool       `gorm:"not null;default:false" json:"is_verified"`
-	Label      *string    `json:"label,omitempty"`
-	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
-}
-
-// MFARecoveryCode stores hashed one-time recovery codes.
-type MFARecoveryCode struct {
-	BaseModel
-	UserID   string     `gorm:"index;not null" json:"user_id"`
-	CodeHash string     `gorm:"index;not null" json:"-"`
-	Used     bool       `gorm:"not null;default:false" json:"used"`
-	UsedAt   *time.Time `json:"used_at,omitempty"`
-}
-
-// PasskeyCredential stores WebAuthn credential data (platform or cross-platform).
-type PasskeyCredential struct {
-	BaseModel
-	UserID          string     `gorm:"index;not null" json:"user_id"`
-	CredentialID    string     `gorm:"uniqueIndex;not null" json:"credential_id"`
-	PublicKey       string     `gorm:"not null" json:"public_key"`
-	SignCount       uint32     `gorm:"not null;default:0" json:"sign_count"`
-	AttestationType string     `json:"attestation_type,omitempty"`
-	AAGUID          string     `json:"aaguid,omitempty"`
-	Transports      *string    `json:"transports,omitempty"`
-	Discoverable    bool       `gorm:"not null;default:false" json:"discoverable"`
-	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
-}
-
 // UserSession stores active login sessions per user.
 // Tokens include a JTI which is recorded here and validated on each request.
 // Deleting rows immediately invalidates the corresponding tokens.

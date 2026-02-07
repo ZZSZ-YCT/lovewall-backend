@@ -89,9 +89,6 @@ func AutoMigrate(db *gorm.DB) error {
 		// &model.RequestLog{}, // REMOVED: This is useless garbage that bloats the DB
 		&model.SubmissionLog{},
 		&model.OperationLog{},
-		&model.UserMFA{},
-		&model.MFARecoveryCode{},
-		&model.PasskeyCredential{},
 		&model.UserSession{},
 		&model.PostView{},
 		&model.Notification{},

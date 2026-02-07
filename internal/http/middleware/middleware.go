@@ -8,7 +8,6 @@ import (
 
 	basichttp "lovewall/internal/http"
 	"lovewall/internal/model"
-	"lovewall/internal/service"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -110,7 +109,6 @@ type UserClaims struct {
 const CtxUserID = "user_id"
 const CtxIsSuper = "is_super"
 const CtxIsAdmin = "is_admin"
-const CtxAdminMFAOK = "admin_mfa_ok"
 const CtxTokenStr = "token_str"
 const CtxTokenExp = "token_exp"
 const CtxTokenJTI = "token_jti"
@@ -227,24 +225,12 @@ func IsSuper(c *gin.Context, db *gorm.DB) bool {
 	if !u.IsSuperadmin {
 		return false
 	}
-	if !adminMFAOk(c, db) {
-		return false
-	}
 	return true
 }
 
 // RequirePerm checks for a specific permission, superadmin always allowed.
 func RequirePerm(db *gorm.DB, perm string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if isAdminUser(c, db) && !adminMFAOk(c, db) {
-			basichttp.FailWithExtras(c, http.StatusForbidden, "ADMIN_MFA_REQUIRED", "admin access requires MFA", gin.H{
-				"mfa_required":        true,
-				"admin_mfa_required":  true,
-				"mfa_enforced_action": perm,
-			})
-			c.Abort()
-			return
-		}
 		if IsSuper(c, db) {
 			c.Next()
 			return
@@ -290,47 +276,6 @@ func isAdminUser(c *gin.Context, db *gorm.DB) bool {
 	isAdmin := cnt > 0
 	c.Set(CtxIsAdmin, isAdmin)
 	return isAdmin
-}
-
-func adminMFAOk(c *gin.Context, db *gorm.DB) bool {
-	if !isAdminUser(c, db) {
-		return true
-	}
-	if v, ok := c.Get(CtxAdminMFAOK); ok {
-		if b, ok2 := v.(bool); ok2 {
-			return b
-		}
-	}
-	uidVal, ok := c.Get(CtxUserID)
-	if !ok {
-		return false
-	}
-	uid, _ := uidVal.(string)
-	okVal := service.HasVerifiedMFA(db, uid)
-	c.Set(CtxAdminMFAOK, okVal)
-	return okVal
-}
-
-// EnforceAdminMFA aborts the request with an explicit MFA error when an admin has no verified MFA.
-func EnforceAdminMFA(c *gin.Context, db *gorm.DB, action string) bool {
-	if isAdminUser(c, db) && !adminMFAOk(c, db) {
-		msg := "admin access requires MFA"
-		if action != "" {
-			basichttp.FailWithExtras(c, http.StatusForbidden, "ADMIN_MFA_REQUIRED", msg, gin.H{
-				"mfa_required":        true,
-				"admin_mfa_required":  true,
-				"mfa_enforced_action": action,
-			})
-		} else {
-			basichttp.FailWithExtras(c, http.StatusForbidden, "ADMIN_MFA_REQUIRED", msg, gin.H{
-				"mfa_required":       true,
-				"admin_mfa_required": true,
-			})
-		}
-		c.Abort()
-		return false
-	}
-	return true
 }
 
 func CORS(allowedOrigins []string) gin.HandlerFunc {
@@ -613,12 +558,6 @@ func ValidateSessionAndUser(db *gorm.DB) gin.HandlerFunc {
 			isAdmin = permCnt > 0
 		}
 		c.Set(CtxIsAdmin, isAdmin)
-
-		adminMFAOk := true
-		if isAdmin {
-			adminMFAOk = service.HasVerifiedMFA(db, uid)
-		}
-		c.Set(CtxAdminMFAOK, adminMFAOk)
 		c.Next()
 	}
 }
