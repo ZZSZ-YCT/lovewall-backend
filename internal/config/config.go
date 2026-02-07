@@ -18,10 +18,6 @@ type Config struct {
 	JWTTTL         int64
 	RefreshTTL     int64
 	CookieName     string
-	WebAuthnRPID   string
-	WebAuthnOrigin string
-	WebAuthnRPName string
-	MFAIssuer      string
 	UploadDir      string
 	UploadBaseURL  string
 	MaxUploadMB    int64
@@ -200,10 +196,6 @@ func Load() *Config {
 		JWTTTL:                      getint64("JWT_TTL", 86400),
 		RefreshTTL:                  getint64("REFRESH_TTL", 2592000),
 		CookieName:                  getenv("COOKIE_NAME", "auth_token"),
-		MFAIssuer:                   getenv("MFA_ISSUER", "LoveWall"),
-		WebAuthnRPID:                getenv("WEBAUTHN_RP_ID", ""),
-		WebAuthnOrigin:              getenv("WEBAUTHN_ORIGIN", ""),
-		WebAuthnRPName:              getenv("WEBAUTHN_RP_NAME", "LoveWall"),
 		UploadDir:                   uploadDir,
 		UploadBaseURL:               getenv("UPLOAD_BASE_URL", "/uploads"),
 		MaxUploadMB:                 getint64("MAX_UPLOAD_MB", 10),
