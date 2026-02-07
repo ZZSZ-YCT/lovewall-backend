@@ -3,7 +3,6 @@ package handler
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/hex"
@@ -40,15 +39,10 @@ type AuthHandler struct {
 	cfg        *config.Config
 	cache      service.Cache
 	captchaSvc *service.CaptchaService
-	passkey    *service.WebAuthnService
 }
 
 func NewAuthHandler(db *gorm.DB, cfg *config.Config, cache service.Cache, captchaSvc *service.CaptchaService) *AuthHandler {
-	passkeySvc, err := service.NewWebAuthnService(cfg, db, cache)
-	if err != nil && !errors.Is(err, service.ErrWebAuthnNotConfigured) {
-		zap.L().Warn("init webauthn failed", zap.Error(err))
-	}
-	return &AuthHandler{db: db, cfg: cfg, cache: cache, captchaSvc: captchaSvc, passkey: passkeySvc}
+	return &AuthHandler{db: db, cfg: cfg, cache: cache, captchaSvc: captchaSvc}
 }
 
 func (h *AuthHandler) ensureCaptcha(c *gin.Context, captchaID string, payload service.VerifyPayload) bool {
@@ -152,13 +146,11 @@ func (h *AuthHandler) Register(c *gin.Context) {
 }
 
 type LoginRequest struct {
-	Username     string             `json:"username" binding:"required"`
-	Password     string             `json:"password" binding:"required"`
-	CaptchaID    string             `json:"captcha_id" binding:"required"`
-	CaptchaData  json.RawMessage    `json:"captcha_data"`
-	Dots         []service.DotInput `json:"dots"`
-	MFACode      string             `json:"mfa_code"`
-	RecoveryCode string             `json:"recovery_code"`
+	Username    string             `json:"username" binding:"required"`
+	Password    string             `json:"password" binding:"required"`
+	CaptchaID   string             `json:"captcha_id" binding:"required"`
+	CaptchaData json.RawMessage    `json:"captcha_data"`
+	Dots        []service.DotInput `json:"dots"`
 }
 
 func (h *AuthHandler) Login(c *gin.Context) {
@@ -192,37 +184,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	u.LastLoginAt = &now
 	u.LastIP = &ip
 	h.db.Model(&u).Updates(map[string]any{"last_login_at": u.LastLoginAt, "last_ip": u.LastIP})
-
-	isAdmin := hasAnyAdminPermission(h.db, u.ID)
-	mfaEnabled := service.HasVerifiedMFA(h.db, u.ID)
-	passkeyAvailable := service.HasPasskey(h.db, u.ID)
-	totpAvailable := hasTOTP(h.db, u.ID)
-	if mfaEnabled {
-		if strings.TrimSpace(req.MFACode) == "" && strings.TrimSpace(req.RecoveryCode) == "" {
-			mfaToken, err := h.createPendingMFAToken(c.Request.Context(), u.ID)
-			if err != nil {
-				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to prepare MFA challenge")
-				return
-			}
-			basichttp.FailWithExtras(c, http.StatusUnauthorized, "MFA_REQUIRED", "multi-factor authentication required", gin.H{
-				"mfa_required":         true,
-				"mfa_required_totp":    totpAvailable,
-				"mfa_required_passkey": passkeyAvailable,
-				"mfa_token":            mfaToken,
-				"admin_mfa_required":   isAdmin,
-			})
-			return
-		}
-		if _, err := service.VerifyMFA(h.db, u.ID, req.MFACode, req.RecoveryCode); err != nil {
-			basichttp.FailWithExtras(c, http.StatusUnauthorized, "MFA_REQUIRED", "invalid MFA code", gin.H{
-				"mfa_required":         true,
-				"mfa_required_totp":    totpAvailable,
-				"mfa_required_passkey": passkeyAvailable,
-				"admin_mfa_required":   isAdmin,
-			})
-			return
-		}
-	}
 	h.finishLogin(c, &u)
 }
 
@@ -428,351 +389,9 @@ func (h *AuthHandler) Profile(c *gin.Context) {
 	for _, p := range perms {
 		pstrs = append(pstrs, p.Permission)
 	}
-	mfaEnabled := service.HasVerifiedMFA(h.db, u.ID)
-	isAdmin := hasAnyAdminPermission(h.db, u.ID)
 	basichttp.OK(c, gin.H{
-		"user":                     sanitizeUser(h.db, &u),
-		"permissions":              pstrs,
-		"mfa_enabled":              mfaEnabled,
-		"admin_mfa_required":       isAdmin && !mfaEnabled,
-		"recovery_codes_remaining": service.RecoveryCodesRemaining(h.db, u.ID),
-	})
-}
-
-// POST /api/login/mfa/verify (public; second-step after password)
-func (h *AuthHandler) LoginMFAVerify(c *gin.Context) {
-	var body struct {
-		MFAToken     string `json:"mfa_token" binding:"required"`
-		MFACode      string `json:"mfa_code"`
-		RecoveryCode string `json:"recovery_code"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid payload")
-		return
-	}
-	if strings.TrimSpace(body.MFACode) == "" && strings.TrimSpace(body.RecoveryCode) == "" {
-		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "mfa_code or recovery_code required")
-		return
-	}
-	userID, err := h.getPendingMFASession(c.Request.Context(), body.MFAToken, true)
-	if err != nil {
-		basichttp.Fail(c, http.StatusUnauthorized, "MFA_REQUIRED", "invalid or expired MFA token")
-		return
-	}
-	var user model.User
-	if err := h.db.First(&user, "id = ? AND deleted_at IS NULL", userID).Error; err != nil {
-		basichttp.Fail(c, http.StatusUnauthorized, "UNAUTHORIZED", "user not found")
-		return
-	}
-	if user.IsBanned {
-		reason := "account has been banned"
-		if user.BanReason != nil && *user.BanReason != "" {
-			reason = *user.BanReason
-		}
-		basichttp.FailWithExtras(c, http.StatusForbidden, "BANNED", reason, gin.H{"banned": true, "ban_reason": reason})
-		return
-	}
-	if _, err := service.VerifyMFA(h.db, user.ID, body.MFACode, body.RecoveryCode); err != nil {
-		basichttp.Fail(c, http.StatusUnauthorized, "MFA_REQUIRED", "invalid MFA code")
-		return
-	}
-	h.finishLogin(c, &user)
-}
-
-// GET /api/mfa/status (auth)
-func (h *AuthHandler) MFAStatus(c *gin.Context) {
-	uidVal, _ := c.Get(mw.CtxUserID)
-	userID := uidVal.(string)
-	enabled := service.HasVerifiedMFA(h.db, userID)
-	factors, err := service.ListMFAFactors(h.db, userID)
-	if err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to load MFA factors")
-		return
-	}
-	isAdmin := hasAnyAdminPermission(h.db, userID)
-	basichttp.OK(c, gin.H{
-		"enabled":                  enabled,
-		"factors":                  factors,
-		"admin_mfa_required":       isAdmin && !enabled,
-		"recovery_codes_remaining": service.RecoveryCodesRemaining(h.db, userID),
-	})
-}
-
-// POST /api/mfa/totp/setup (auth)
-func (h *AuthHandler) SetupTOTP(c *gin.Context) {
-	uidVal, _ := c.Get(mw.CtxUserID)
-	userID := uidVal.(string)
-	var user model.User
-	if err := h.db.Select("id", "username").First(&user, "id = ? AND deleted_at IS NULL", userID).Error; err != nil {
-		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
-		return
-	}
-	secret, uri, err := service.GenerateTOTPSecret(user.Username, h.cfg.MFAIssuer)
-	if err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to generate secret")
-		return
-	}
-	_ = h.db.Where("user_id = ? AND type = ? AND is_verified = ?", userID, service.MFATypeTOTP, false).Delete(&model.UserMFA{}).Error
-	factor := &model.UserMFA{
-		UserID:     userID,
-		Type:       service.MFATypeTOTP,
-		Secret:     secret,
-		IsVerified: false,
-	}
-	if err := h.db.Create(factor).Error; err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to persist MFA secret")
-		return
-	}
-	basichttp.OK(c, gin.H{
-		"factor_id":   factor.ID,
-		"secret":      secret,
-		"otpauth_uri": uri,
-	})
-}
-
-// POST /api/mfa/totp/verify (auth)
-func (h *AuthHandler) VerifyTOTP(c *gin.Context) {
-	uidVal, _ := c.Get(mw.CtxUserID)
-	userID := uidVal.(string)
-	var req struct {
-		FactorID string `json:"factor_id" binding:"required"`
-		Code     string `json:"code" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid payload")
-		return
-	}
-	var factor model.UserMFA
-	if err := h.db.First(&factor, "id = ? AND user_id = ? AND type = ? AND deleted_at IS NULL", req.FactorID, userID, service.MFATypeTOTP).Error; err != nil {
-		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "MFA factor not found")
-		return
-	}
-	if !service.ValidateTOTP(factor.Secret, req.Code) {
-		basichttp.Fail(c, http.StatusUnauthorized, "MFA_REQUIRED", "invalid code")
-		return
-	}
-	now := time.Now()
-	if err := h.db.Model(&factor).Updates(map[string]any{"is_verified": true, "last_used_at": now}).Error; err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to enable MFA")
-		return
-	}
-	codes, err := service.GenerateRecoveryCodes(10)
-	if err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to generate recovery codes")
-		return
-	}
-	if err := service.ReplaceRecoveryCodes(h.db, userID, codes); err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to save recovery codes")
-		return
-	}
-	basichttp.OK(c, gin.H{
-		"mfa_enabled":              true,
-		"recovery_codes":           codes,
-		"recovery_codes_remaining": len(codes),
-	})
-}
-
-// POST /api/mfa/recovery/regenerate (auth)
-func (h *AuthHandler) RegenerateRecoveryCodes(c *gin.Context) {
-	uidVal, _ := c.Get(mw.CtxUserID)
-	userID := uidVal.(string)
-	if !service.HasVerifiedMFA(h.db, userID) {
-		basichttp.Fail(c, http.StatusBadRequest, "MFA_NOT_ENABLED", "enable MFA first")
-		return
-	}
-	var req struct {
-		Code string `json:"code" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid payload")
-		return
-	}
-	if _, err := service.VerifyMFA(h.db, userID, req.Code, ""); err != nil {
-		basichttp.Fail(c, http.StatusUnauthorized, "MFA_REQUIRED", "invalid MFA code")
-		return
-	}
-	codes, err := service.GenerateRecoveryCodes(10)
-	if err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to generate recovery codes")
-		return
-	}
-	if err := service.ReplaceRecoveryCodes(h.db, userID, codes); err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to save recovery codes")
-		return
-	}
-	basichttp.OK(c, gin.H{
-		"recovery_codes":           codes,
-		"recovery_codes_remaining": len(codes),
-	})
-}
-
-// POST /api/mfa/passkey/register/options (auth)
-func (h *AuthHandler) PasskeyRegisterOptions(c *gin.Context) {
-	if h.passkey == nil {
-		basichttp.Fail(c, http.StatusBadRequest, "MFA_NOT_AVAILABLE", "passkey not configured")
-		return
-	}
-	uidVal, _ := c.Get(mw.CtxUserID)
-	userID := uidVal.(string)
-	var user model.User
-	if err := h.db.First(&user, "id = ? AND deleted_at IS NULL", userID).Error; err != nil {
-		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
-		return
-	}
-	opts, state, err := h.passkey.BeginRegistration(c.Request.Context(), &user)
-	if err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to start passkey registration")
-		return
-	}
-	basichttp.OK(c, gin.H{"options": opts, "state": state})
-}
-
-// POST /api/mfa/passkey/register/verify (auth)
-func (h *AuthHandler) PasskeyRegisterVerify(c *gin.Context) {
-	if h.passkey == nil {
-		basichttp.Fail(c, http.StatusBadRequest, "MFA_NOT_AVAILABLE", "passkey not configured")
-		return
-	}
-	uidVal, _ := c.Get(mw.CtxUserID)
-	userID := uidVal.(string)
-	var user model.User
-	if err := h.db.First(&user, "id = ? AND deleted_at IS NULL", userID).Error; err != nil {
-		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
-		return
-	}
-	raw, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		basichttp.Fail(c, http.StatusBadRequest, "VALIDATION_FAILED", "invalid payload")
-		return
-	}
-	defer c.Request.Body.Close()
-	var meta struct {
-		State string `json:"state"`
-	}
-	if err := json.Unmarshal(raw, &meta); err != nil || strings.TrimSpace(meta.State) == "" {
-		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "state required")
-		return
-	}
-	c.Request.Body = io.NopCloser(bytes.NewBuffer(raw))
-	if err := h.passkey.FinishRegistration(c.Request.Context(), &user, meta.State, c.Request); err != nil {
-		basichttp.Fail(c, http.StatusUnauthorized, "MFA_REQUIRED", "passkey verification failed")
-		return
-	}
-	basichttp.OK(c, gin.H{
-		"mfa_enabled":              true,
-		"admin_mfa_required":       hasAnyAdminPermission(h.db, user.ID) && !service.HasVerifiedMFA(h.db, user.ID),
-		"recovery_codes_remaining": service.RecoveryCodesRemaining(h.db, user.ID),
-	})
-}
-
-// POST /api/mfa/passkey/login/options (public)
-func (h *AuthHandler) PasskeyLoginOptions(c *gin.Context) {
-	if h.passkey == nil {
-		basichttp.Fail(c, http.StatusBadRequest, "MFA_NOT_AVAILABLE", "passkey not configured")
-		return
-	}
-	var body struct {
-		MFAToken string `json:"mfa_token" binding:"required"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid payload")
-		return
-	}
-	var user model.User
-	userID, err := h.getPendingMFASession(c.Request.Context(), body.MFAToken, false)
-	if err != nil {
-		basichttp.Fail(c, http.StatusUnauthorized, "MFA_REQUIRED", "invalid or expired MFA token")
-		return
-	}
-	if err := h.db.Where("id = ? AND deleted_at IS NULL", userID).First(&user).Error; err != nil {
-		basichttp.Fail(c, http.StatusUnauthorized, "UNAUTHORIZED", "user not found")
-		return
-	}
-	if user.IsBanned {
-		reason := "account has been banned"
-		if user.BanReason != nil && *user.BanReason != "" {
-			reason = *user.BanReason
-		}
-		basichttp.FailWithExtras(c, http.StatusForbidden, "BANNED", reason, gin.H{"banned": true, "ban_reason": reason})
-		return
-	}
-	opts, state, err := h.passkey.BeginLogin(c.Request.Context(), &user)
-	if err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to start passkey login")
-		return
-	}
-	basichttp.OK(c, gin.H{"options": opts, "state": state})
-}
-
-// POST /api/mfa/passkey/login/verify (public)
-func (h *AuthHandler) PasskeyLoginVerify(c *gin.Context) {
-	if h.passkey == nil {
-		basichttp.Fail(c, http.StatusBadRequest, "MFA_NOT_AVAILABLE", "passkey not configured")
-		return
-	}
-	raw, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		basichttp.Fail(c, http.StatusBadRequest, "VALIDATION_FAILED", "invalid payload")
-		return
-	}
-	defer c.Request.Body.Close()
-	var body struct {
-		MFAToken string `json:"mfa_token"`
-		State    string `json:"state"`
-	}
-	if err := json.Unmarshal(raw, &body); err != nil || strings.TrimSpace(body.MFAToken) == "" || strings.TrimSpace(body.State) == "" {
-		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "mfa_token and state required")
-		return
-	}
-	c.Request.Body = io.NopCloser(bytes.NewBuffer(raw))
-	var user model.User
-	userID, err := h.getPendingMFASession(c.Request.Context(), body.MFAToken, true)
-	if err != nil {
-		basichttp.Fail(c, http.StatusUnauthorized, "MFA_REQUIRED", "invalid or expired MFA token")
-		return
-	}
-	if err := h.db.Where("id = ? AND deleted_at IS NULL", userID).First(&user).Error; err != nil {
-		basichttp.Fail(c, http.StatusUnauthorized, "UNAUTHORIZED", "user not found")
-		return
-	}
-	if user.IsBanned {
-		reason := "account has been banned"
-		if user.BanReason != nil && *user.BanReason != "" {
-			reason = *user.BanReason
-		}
-		basichttp.FailWithExtras(c, http.StatusForbidden, "BANNED", reason, gin.H{"banned": true, "ban_reason": reason})
-		return
-	}
-	if err := h.passkey.FinishLogin(c.Request.Context(), &user, body.State, c.Request); err != nil {
-		basichttp.Fail(c, http.StatusUnauthorized, "UNAUTHORIZED", "passkey verification failed")
-		return
-	}
-	now := time.Now()
-	ip := c.ClientIP()
-	user.LastLoginAt = &now
-	user.LastIP = &ip
-	h.db.Model(&user).Updates(map[string]any{"last_login_at": user.LastLoginAt, "last_ip": user.LastIP})
-
-	token, jti, err := auth.SignWithJTI(h.cfg.JWTSecret, user.ID, user.IsSuperadmin, h.cfg.JWTTTL)
-	if err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to sign token")
-		return
-	}
-	if err := h.createSessionAndEnforceLimit(c, user.ID, jti); err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to persist session")
-		return
-	}
-	if h.cfg.CookieName != "" {
-		c.SetCookie(h.cfg.CookieName, token, int(h.cfg.JWTTTL), "/", "", true, true)
-	}
-	mfaEnabled := service.HasVerifiedMFA(h.db, user.ID)
-	basichttp.OK(c, gin.H{
-		"user":                     sanitizeUser(h.db, &user),
-		"access_token":             token,
-		"mfa_enabled":              mfaEnabled,
-		"admin_mfa_required":       hasAnyAdminPermission(h.db, user.ID) && !mfaEnabled,
-		"recovery_codes_remaining": service.RecoveryCodesRemaining(h.db, user.ID),
-		"passkey_login":            true,
+		"user":        sanitizeUser(h.db, &u),
+		"permissions": pstrs,
 	})
 }
 
@@ -854,69 +473,9 @@ func batchQueryAdminStatus(db *gorm.DB, userIDs []string) (map[string]*model.Use
 	return userMap, permMap, nil
 }
 
-func hasTOTP(db *gorm.DB, userID string) bool {
-	var cnt int64
-	db.Model(&model.UserMFA{}).
-		Where("user_id = ? AND type = ? AND is_verified = ? AND deleted_at IS NULL", userID, service.MFATypeTOTP, true).
-		Count(&cnt)
-	return cnt > 0
-}
-
-type pendingMFASession struct {
-	UserID string `json:"user_id"`
-}
-
-func (h *AuthHandler) createPendingMFAToken(ctx context.Context, userID string) (string, error) {
-	if h.cache == nil {
-		return "", errors.New("cache not initialized")
-	}
-	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	token := hex.EncodeToString(buf)
-	data, _ := json.Marshal(&pendingMFASession{UserID: userID})
-	if err := h.cache.Set(ctx, pendingMFATokenKey(token), data, 10*time.Minute); err != nil {
-		return "", err
-	}
-	return token, nil
-}
-
-func (h *AuthHandler) getPendingMFASession(ctx context.Context, token string, consume bool) (string, error) {
-	if h.cache == nil {
-		return "", errors.New("cache not initialized")
-	}
-	if strings.TrimSpace(token) == "" {
-		return "", errors.New("invalid token")
-	}
-	raw, ok, err := h.cache.Get(ctx, pendingMFATokenKey(token))
-	if err != nil {
-		return "", err
-	}
-	if !ok {
-		return "", errors.New("token not found")
-	}
-	var sess pendingMFASession
-	if err := json.Unmarshal(raw, &sess); err != nil {
-		return "", err
-	}
-	if consume {
-		_ = h.cache.Delete(ctx, pendingMFATokenKey(token))
-	}
-	return sess.UserID, nil
-}
-
-func pendingMFATokenKey(token string) string {
-	return "mfa:pending:" + token
-}
-
 func sanitizeUser(db *gorm.DB, u *model.User) gin.H {
 	isAdmin := hasAnyAdminPermission(db, u.ID)
 	result := sanitizeUserCached(u, isAdmin)
-	mfaEnabled := service.HasVerifiedMFA(db, u.ID)
-	result["mfa_enabled"] = mfaEnabled
-	result["admin_mfa_required"] = isAdmin && !mfaEnabled
-	result["recovery_codes_remaining"] = service.RecoveryCodesRemaining(db, u.ID)
 
 	// Add active tag
 	tagService := service.NewUserTagService(db)
@@ -952,14 +511,9 @@ func (h *AuthHandler) finishLogin(c *gin.Context, u *model.User) {
 	if h.cfg.CookieName != "" {
 		c.SetCookie(h.cfg.CookieName, token, int(h.cfg.JWTTTL), "/", "", true, true)
 	}
-	mfaEnabled := service.HasVerifiedMFA(h.db, u.ID)
-	adminMFARequired := hasAnyAdminPermission(h.db, u.ID) && !mfaEnabled
 	basichttp.OK(c, gin.H{
-		"user":                     sanitizeUser(h.db, u),
-		"access_token":             token,
-		"mfa_enabled":              mfaEnabled,
-		"admin_mfa_required":       adminMFARequired,
-		"recovery_codes_remaining": service.RecoveryCodesRemaining(h.db, u.ID),
+		"user":         sanitizeUser(h.db, u),
+		"access_token": token,
 	})
 }
 
@@ -1095,9 +649,6 @@ func (h *AuthHandler) UpdateUser(c *gin.Context) {
 		hasManageUsers = cnt > 0
 	}
 	if !isSelf {
-		if !mw.EnforceAdminMFA(c, h.db, "MANAGE_USERS") {
-			return
-		}
 	}
 	if !isSelf && !hasManageUsers {
 		basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "no permission")

@@ -136,11 +136,6 @@ func main() {
 	api.GET("/announcements", annH.List)
 	api.GET("/announcements/by-path/*path", annH.GetByPath)
 	api.GET("/tags", tagH.ListTags)
-	// Login MFA second step
-	api.POST("/login/mfa/verify", authH.LoginMFAVerify)
-	// Passkey login second step
-	api.POST("/login/passkey/options", authH.PasskeyLoginOptions)
-	api.POST("/login/passkey/verify", authH.PasskeyLoginVerify)
 
 	authed := api.Group("")
 	authed.Use(mw.RequireAuth(cfg.JWTSecret))
@@ -150,12 +145,6 @@ func main() {
 	authed.PUT("/me/password", authH.ChangeMyPassword)
 	authed.GET("/users/me/online", authH.OnlineStatus)
 	authed.POST("/heartbeat", authH.Heartbeat)
-	authed.GET("/mfa/status", authH.MFAStatus)
-	authed.POST("/mfa/totp/setup", authH.SetupTOTP)
-	authed.POST("/mfa/totp/verify", authH.VerifyTOTP)
-	authed.POST("/mfa/recovery/regenerate", authH.RegenerateRecoveryCodes)
-	authed.POST("/mfa/passkey/register/options", authH.PasskeyRegisterOptions)
-	authed.POST("/mfa/passkey/register/verify", authH.PasskeyRegisterVerify)
 	// Note: Logout is already exposed at /api/logout (public).
 	// The handler supports token extraction and blacklist, so a second
 	// registration here would duplicate the same route and cause a panic.

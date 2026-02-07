@@ -24,9 +24,6 @@ func NewLogHandler(db *gorm.DB, cfg *config.Config) *LogHandler {
 
 // GET /api/admin/logs/submissions (super only)
 func (h *LogHandler) ListSubmissionLogs(c *gin.Context) {
-	if !mw.EnforceAdminMFA(c, h.db, "VIEW_LOGS") {
-		return
-	}
 	if !mw.IsSuper(c, h.db) {
 		basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "superadmin required")
 		return
@@ -71,9 +68,6 @@ func (h *LogHandler) ListSubmissionLogs(c *gin.Context) {
 
 // GET /api/admin/logs/operations (super only)
 func (h *LogHandler) ListOperationLogs(c *gin.Context) {
-	if !mw.EnforceAdminMFA(c, h.db, "VIEW_LOGS") {
-		return
-	}
 	if !mw.IsSuper(c, h.db) {
 		basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "superadmin required")
 		return

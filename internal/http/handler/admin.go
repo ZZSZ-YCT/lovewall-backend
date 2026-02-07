@@ -34,9 +34,6 @@ type permBody struct {
 }
 
 func (h *AdminHandler) SetUserPermissions(c *gin.Context) {
-	if !mw.EnforceAdminMFA(c, h.db, "MANAGE_USERS") {
-		return
-	}
 	if !mw.IsSuper(c, h.db) {
 		basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "superadmin required")
 		return
@@ -104,9 +101,6 @@ func (h *AdminHandler) SetUserPermissions(c *gin.Context) {
 
 // List users (MANAGE_USERS)
 func (h *AdminHandler) ListUsers(c *gin.Context) {
-	if !mw.EnforceAdminMFA(c, h.db, "MANAGE_USERS") {
-		return
-	}
 	q := strings.TrimSpace(c.Query("q"))
 	status := strings.TrimSpace(c.Query("status"))
 	page := 1
@@ -201,9 +195,6 @@ func (h *AdminHandler) ListUsers(c *gin.Context) {
 
 // PUT /api/admin/users/:id/password (auth; MANAGE_USERS or superadmin)
 func (h *AdminHandler) UpdateUserPassword(c *gin.Context) {
-	if !mw.EnforceAdminMFA(c, h.db, "MANAGE_USERS") {
-		return
-	}
 	id := c.Param("id")
 	// Permission check: superadmin or MANAGE_USERS
 	if !mw.IsSuper(c, h.db) {
@@ -263,9 +254,6 @@ func (h *AdminHandler) UpdateUserPassword(c *gin.Context) {
 // POST /api/admin/users/:id/ban (auth; MANAGE_USERS or super)
 // Body: {"reason":"string"}
 func (h *AdminHandler) BanUser(c *gin.Context) {
-	if !mw.EnforceAdminMFA(c, h.db, "MANAGE_USERS") {
-		return
-	}
 	id := c.Param("id")
 	// Permission check: superadmin or MANAGE_USERS
 	if !mw.IsSuper(c, h.db) {
@@ -316,9 +304,6 @@ func (h *AdminHandler) BanUser(c *gin.Context) {
 
 // POST /api/admin/users/:id/unban (auth; MANAGE_USERS or super)
 func (h *AdminHandler) UnbanUser(c *gin.Context) {
-	if !mw.EnforceAdminMFA(c, h.db, "MANAGE_USERS") {
-		return
-	}
 	id := c.Param("id")
 	if !mw.IsSuper(c, h.db) {
 		uid, _ := c.Get(mw.CtxUserID)
@@ -360,9 +345,6 @@ func (h *AdminHandler) UnbanUser(c *gin.Context) {
 // Soft delete a user to prevent future login while preserving posts/comments and profile display.
 // Also revokes all active sessions immediately.
 func (h *AdminHandler) DeleteUser(c *gin.Context) {
-	if !mw.EnforceAdminMFA(c, h.db, "SUPERADMIN") {
-		return
-	}
 	if !mw.IsSuper(c, h.db) {
 		basichttp.Fail(c, http.StatusForbidden, "FORBIDDEN", "superadmin required")
 		return
@@ -400,9 +382,6 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 // GET /api/admin/metrics/overview (auth; MANAGE_USERS or super)
 // Returns totals: platform total comments, today's total comments, today's new users
 func (h *AdminHandler) MetricsOverview(c *gin.Context) {
-	if !mw.EnforceAdminMFA(c, h.db, "MANAGE_USERS") {
-		return
-	}
 	// Permission: super or MANAGE_USERS
 	if !mw.IsSuper(c, h.db) {
 		uid, _ := c.Get(mw.CtxUserID)
@@ -447,9 +426,6 @@ func (h *AdminHandler) MetricsOverview(c *gin.Context) {
 
 // POST /api/admin/posts/:id/approve (auth; MANAGE_POSTS or superadmin)
 func (h *AdminHandler) ApprovePost(c *gin.Context) {
-	if !mw.EnforceAdminMFA(c, h.db, "MANAGE_POSTS") {
-		return
-	}
 	id := c.Param("id")
 	// Permission check: allow superadmin or user having the post management permission
 	if !mw.IsSuper(c, h.db) {
@@ -473,9 +449,6 @@ func (h *AdminHandler) ApprovePost(c *gin.Context) {
 // POST /api/admin/posts/:id/reject (auth; MANAGE_POSTS or superadmin)
 // Rejects and permanently deletes the post along with its comments and images
 func (h *AdminHandler) RejectPost(c *gin.Context) {
-	if !mw.EnforceAdminMFA(c, h.db, "MANAGE_POSTS") {
-		return
-	}
 	id := c.Param("id")
 	if !mw.IsSuper(c, h.db) {
 		uid, _ := c.Get(mw.CtxUserID)
