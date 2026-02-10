@@ -1,3 +1,7 @@
+// Deprecated: This file is retained for reference only.
+// All comment functionality has been migrated to X-style post replies.
+// Comment data has been migrated to posts with reply_to_id set.
+// Routes have been removed from main.go.
 package handler
 
 import (
@@ -251,15 +255,33 @@ func (h *CommentHandler) Delete(c *gin.Context) {
 			}
 		}
 	}
-	// Hard delete
-	if err := h.db.Unscoped().Delete(&cm).Error; err != nil {
+	// Hard delete with count decrement in transaction
+	tx := h.db.Begin()
+	if tx.Error != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "transaction failed")
+		return
+	}
+
+	if err := tx.Unscoped().Delete(&cm).Error; err != nil {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
 		return
 	}
+
 	// Decrement post comment count only if it had been visible
 	if cm.Status == 0 {
-		_ = h.db.Model(&model.Post{}).Where("id = ?", cm.PostID).Update("comment_count", gorm.Expr("comment_count - 1")).Error
+		if err := tx.Model(&model.Post{}).Where("id = ?", cm.PostID).Update("comment_count", gorm.Expr("CASE WHEN comment_count > 0 THEN comment_count - 1 ELSE 0 END")).Error; err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+			return
+		}
 	}
+
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+		return
+	}
+
 	basichttp.OK(c, gin.H{"id": id, "deleted": true})
 }
 
@@ -312,12 +334,30 @@ func (h *CommentHandler) Update(c *gin.Context) {
 	}
 	// set pending moderation again; if previously visible, decrement post comment_count
 	wasVisible := (cm.Status == 0)
-	if err := h.db.Model(&model.Comment{}).Where("id = ?", id).Updates(map[string]any{"content": *body.Content, "status": 1, "audit_status": 1, "audit_msg": nil}).Error; err != nil {
+
+	tx := h.db.Begin()
+	if tx.Error != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "transaction failed")
+		return
+	}
+
+	if err := tx.Model(&model.Comment{}).Where("id = ?", id).Updates(map[string]any{"content": *body.Content, "status": 1, "audit_status": 1, "audit_msg": nil}).Error; err != nil {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
 		return
 	}
+
 	if wasVisible {
-		_ = h.db.Model(&model.Post{}).Where("id = ?", cm.PostID).Update("comment_count", gorm.Expr("comment_count - 1")).Error
+		if err := tx.Model(&model.Post{}).Where("id = ?", cm.PostID).Update("comment_count", gorm.Expr("CASE WHEN comment_count > 0 THEN comment_count - 1 ELSE 0 END")).Error; err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+			return
+		}
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+		return
 	}
 	// enqueue moderation
 	service.EnqueueCommentModeration(id)

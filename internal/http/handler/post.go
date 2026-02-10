@@ -37,9 +37,12 @@ func NewPostHandler(db *gorm.DB, cfg *config.Config) *PostHandler {
 type CreatePostForm struct {
 	AuthorName    string `form:"author_name" json:"author_name"`
 	TargetName    string `form:"target_name" json:"target_name"`
-	Content       string `form:"content" binding:"required" json:"content"`
+	Content       string `form:"content" json:"content"`
 	ConfessorMode string `form:"confessor_mode" json:"confessor_mode"` // optional: "self" or "custom"
 	CardType      string `form:"card_type" json:"card_type"`
+	ReplyToID     string `form:"reply_to_id" json:"reply_to_id"`
+	RepostOfID    string `form:"repost_of_id" json:"repost_of_id"`
+	QuoteOfID     string `form:"quote_of_id" json:"quote_of_id"`
 }
 
 func (h *PostHandler) CreatePost(c *gin.Context) {
@@ -48,101 +51,182 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid form")
 		return
 	}
+
+	uid, _ := c.Get(mw.CtxUserID)
+	uidStr := uid.(string)
+
+	// Determine post type: repost, quote, reply, or original
+	isRepost := strings.TrimSpace(form.RepostOfID) != ""
+	isQuote := strings.TrimSpace(form.QuoteOfID) != ""
+	isReply := strings.TrimSpace(form.ReplyToID) != ""
+
+	// Validate: cannot be multiple types at once
+	typeCount := 0
+	if isRepost {
+		typeCount++
+	}
+	if isQuote {
+		typeCount++
+	}
+	if isReply {
+		typeCount++
+	}
+	if typeCount > 1 {
+		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "post can only be one of: reply, repost, or quote")
+		return
+	}
+
+	// Repost: no content allowed
+	if isRepost && strings.TrimSpace(form.Content) != "" {
+		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "repost cannot have content")
+		return
+	}
+	// Quote: content required
+	if isQuote && strings.TrimSpace(form.Content) == "" {
+		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "quote must have content")
+		return
+	}
+	// Original/reply: content required
+	if !isRepost && strings.TrimSpace(form.Content) == "" {
+		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "content is required")
+		return
+	}
+
+	// Validate target post exists for repost/quote/reply
+	var replyToID, repostOfID, quoteOfID *string
+	if isReply {
+		var target model.Post
+		if err := h.db.First(&target, "id = ? AND deleted_at IS NULL", strings.TrimSpace(form.ReplyToID)).Error; err != nil {
+			basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "reply target post not found")
+			return
+		}
+		if target.Status != 0 {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "cannot reply to hidden post")
+			return
+		}
+		id := strings.TrimSpace(form.ReplyToID)
+		replyToID = &id
+	}
+	if isRepost {
+		var target model.Post
+		if err := h.db.First(&target, "id = ? AND deleted_at IS NULL AND status = 0", strings.TrimSpace(form.RepostOfID)).Error; err != nil {
+			basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "repost target not found")
+			return
+		}
+		id := strings.TrimSpace(form.RepostOfID)
+		repostOfID = &id
+	}
+	if isQuote {
+		var target model.Post
+		if err := h.db.First(&target, "id = ? AND deleted_at IS NULL AND status = 0", strings.TrimSpace(form.QuoteOfID)).Error; err != nil {
+			basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "quote target not found")
+			return
+		}
+		id := strings.TrimSpace(form.QuoteOfID)
+		quoteOfID = &id
+	}
+
 	cardType := strings.ToLower(strings.TrimSpace(form.CardType))
 	if cardType == "" {
-		cardType = "confession"
+		if isReply || isRepost || isQuote {
+			cardType = "social"
+		} else {
+			cardType = "confession"
+		}
 	}
 	if cardType != "confession" && cardType != "social" {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid card_type")
 		return
 	}
 	targetName := strings.TrimSpace(form.TargetName)
-	if cardType == "confession" && targetName == "" {
+	if cardType == "confession" && targetName == "" && !isReply && !isRepost && !isQuote {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "target_name is required for confession cards")
 		return
 	}
-	uid, _ := c.Get(mw.CtxUserID)
+
 	// Handle multiple images: up to 9 images, each <= 5MB
 	const maxImages = 9
 	const perFileLimitBytes int64 = 5 * 1024 * 1024
 	imageURLs := make([]string, 0)
-	if formdata, err := c.MultipartForm(); err == nil && formdata != nil {
-		files := formdata.File["images"]
-		if len(files) == 0 {
-			// Fallback to single key "image"
-			if single := formdata.File["image"]; len(single) > 0 {
-				files = single
+	if !isRepost { // reposts don't have images
+		if formdata, err := c.MultipartForm(); err == nil && formdata != nil {
+			files := formdata.File["images"]
+			if len(files) == 0 {
+				if single := formdata.File["image"]; len(single) > 0 {
+					files = single
+				}
 			}
-		}
-		if len(files) > 0 {
-			if len(files) > maxImages {
-				basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", fmt.Sprintf("too many images (max %d)", maxImages))
-				return
-			}
-			lp := &storage.LocalProvider{BaseDir: h.cfg.UploadDir}
-			for _, fh := range files {
-				if fh.Size > perFileLimitBytes {
-					basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "file too large (limit 5MB per image)")
+			if len(files) > 0 {
+				if len(files) > maxImages {
+					basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", fmt.Sprintf("too many images (max %d)", maxImages))
 					return
 				}
-				f, err := fh.Open()
-				if err != nil {
-					basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "open file failed")
-					return
-				}
-				// Read header for MIME detection
-				buf := make([]byte, 512)
-				n, err := f.Read(buf)
-				if err != nil && err != io.EOF {
-					f.Close()
-					basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "read file failed")
-					return
-				}
-				mime := http.DetectContentType(buf[:n])
-				ext := storage.ExtFromMIME(mime)
-				if ext == "" {
-					f.Close()
-					basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "unsupported mime")
-					return
-				}
-				// rewind if possible
-				if seeker, ok := f.(interface {
-					Seek(int64, int) (int64, error)
-				}); ok {
-					if _, err := seeker.Seek(0, 0); err != nil {
-						f.Close()
-						basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "file seek failed")
+				lp := &storage.LocalProvider{BaseDir: h.cfg.UploadDir}
+				for _, fh := range files {
+					if fh.Size > perFileLimitBytes {
+						basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "file too large (limit 5MB per image)")
 						return
 					}
-				}
-				savedName := uuid.NewString() + ext
-				if _, err := lp.Save(c, f, savedName); err != nil {
+					f, err := fh.Open()
+					if err != nil {
+						basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "open file failed")
+						return
+					}
+					buf := make([]byte, 512)
+					n, err := f.Read(buf)
+					if err != nil && err != io.EOF {
+						f.Close()
+						basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "read file failed")
+						return
+					}
+					mime := http.DetectContentType(buf[:n])
+					ext := storage.ExtFromMIME(mime)
+					if ext == "" {
+						f.Close()
+						basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "unsupported mime")
+						return
+					}
+					if seeker, ok := f.(interface {
+						Seek(int64, int) (int64, error)
+					}); ok {
+						if _, err := seeker.Seek(0, 0); err != nil {
+							f.Close()
+							basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "file seek failed")
+							return
+						}
+					}
+					savedName := uuid.NewString() + ext
+					if _, err := lp.Save(c, f, savedName); err != nil {
+						f.Close()
+						basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "save file failed")
+						return
+					}
 					f.Close()
-					basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "save file failed")
-					return
+					url := storage.JoinURL(h.cfg.UploadBaseURL, savedName)
+					imageURLs = append(imageURLs, url)
 				}
-				f.Close()
-				url := storage.JoinURL(h.cfg.UploadBaseURL, savedName)
-				imageURLs = append(imageURLs, url)
 			}
 		}
 	}
 
-	// Determine confessor mode and author name to store
+	// Determine confessor mode and author name
 	mode := strings.ToLower(strings.TrimSpace(form.ConfessorMode))
 	if mode == "" {
-		mode = "custom"
+		if isReply || isRepost || isQuote {
+			mode = "self"
+		} else {
+			mode = "custom"
+		}
 	}
 	var authorName string
 	if mode == "self" {
-		authorName = h.getUserDisplayName(uid.(string))
+		authorName = h.getUserDisplayName(uidStr)
 		if strings.TrimSpace(authorName) == "" {
-			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "could not resolve author name for self mode")
-			return
+			authorName = ""
 		}
 	} else {
 		authorName = strings.TrimSpace(form.AuthorName)
-		if authorName == "" {
+		if authorName == "" && !isReply && !isRepost && !isQuote {
 			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "author_name is required when confessor_mode is custom")
 			return
 		}
@@ -150,13 +234,15 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 	}
 
 	// Length validation
-	if len([]rune(form.Content)) > 1000 {
-		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "内容长度超过1000字")
-		return
-	}
-	if len([]rune(form.Content)) > h.cfg.MaxPostChars {
-		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", fmt.Sprintf("内容长度超过限制(%d)", h.cfg.MaxPostChars))
-		return
+	if !isRepost {
+		if len([]rune(form.Content)) > 1000 {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "内容长度超过1000字")
+			return
+		}
+		if len([]rune(form.Content)) > h.cfg.MaxPostChars {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", fmt.Sprintf("内容长度超过限制(%d)", h.cfg.MaxPostChars))
+			return
+		}
 	}
 	if len([]rune(authorName)) > 200 {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "author_name过长")
@@ -168,17 +254,20 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 	}
 
 	p := &model.Post{
-		AuthorID:      uid.(string),
+		AuthorID:      uidStr,
 		AuthorName:    authorName,
 		TargetName:    targetName,
 		Content:       form.Content,
-		Status:        1, // hidden while awaiting AI moderation
+		Status:        1,
 		IsPinned:      false,
 		IsFeatured:    false,
 		ConfessorMode: &mode,
 		CardType:      &cardType,
-		AuditStatus:   1, // pending
+		AuditStatus:   1,
 		AuditMsg:      nil,
+		ReplyToID:     replyToID,
+		RepostOfID:    repostOfID,
+		QuoteOfID:     quoteOfID,
 	}
 	if err := h.db.Create(p).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "create post failed")
@@ -190,14 +279,28 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 		for idx, url := range imageURLs {
 			imgs = append(imgs, model.PostImage{PostID: p.ID, URL: url, SortOrder: idx})
 		}
-		if err := h.db.Create(&imgs).Error; err != nil {
-			// Non-fatal to post creation; log and continue
+		_ = h.db.Create(&imgs).Error
+	}
+	// Note: repost_count and quote_count will be incremented when the post is approved
+	// Parse @mentions and create records
+	if !isRepost && strings.TrimSpace(form.Content) != "" {
+		service.CreateMentions(h.db, p.ID, uidStr, form.Content)
+	}
+	// Notify reply target author
+	if isReply {
+		var parentPost model.Post
+		if err := h.db.Select("author_id").First(&parentPost, "id = ?", *replyToID).Error; err == nil {
+			if parentPost.AuthorID != uidStr {
+				service.Notify(h.db, parentPost.AuthorID, "有人回复了你的帖子", "你的帖子收到了新回复，点击查看。", map[string]any{
+					"post_id":  *replyToID,
+					"reply_id": p.ID,
+					"type":     "reply",
+				})
+			}
 		}
 	}
 	// Log submission
-	if uidStr, ok := uid.(string); ok {
-		service.LogSubmission(h.db, uidStr, "post_create", "post", p.ID, map[string]any{"target_name": p.TargetName, "ip": c.ClientIP()})
-	}
+	service.LogSubmission(h.db, uidStr, "post_create", "post", p.ID, map[string]any{"target_name": p.TargetName, "ip": c.ClientIP()})
 	// Enqueue async moderation
 	service.EnqueuePostModeration(p.ID)
 	basichttp.JSON(c, http.StatusCreated, h.enrichPostWithUserTag(p))
@@ -211,7 +314,47 @@ func (h *PostHandler) ListPosts(c *gin.Context) {
 	}
 	var items []model.Post
 	var total int64
-	q := h.db.Model(&model.Post{}).Where("status = 0 AND deleted_at IS NULL")
+
+	feed := strings.TrimSpace(c.Query("feed"))
+
+	// Base query: only top-level posts (not replies, not reposts)
+	q := h.db.Model(&model.Post{}).Where("status = 0 AND deleted_at IS NULL AND reply_to_id IS NULL AND repost_of_id IS NULL")
+
+	// Feed filtering (requires auth)
+	if feed == "following" || feed == "recommended" {
+		uid, exists := c.Get(mw.CtxUserID)
+		if !exists {
+			basichttp.Fail(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required for feed filtering")
+			return
+		}
+		uidStr := uid.(string)
+
+		// Get blocked user IDs
+		var blockedIDs []string
+		h.db.Model(&model.UserBlock{}).
+			Where("blocker_id = ? AND deleted_at IS NULL", uidStr).
+			Pluck("blocked_id", &blockedIDs)
+
+		// Exclude posts from blocked users
+		if len(blockedIDs) > 0 {
+			q = q.Where("author_id NOT IN ?", blockedIDs)
+		}
+
+		if feed == "following" {
+			// Following feed: posts from users I follow
+			var followingIDs []string
+			h.db.Model(&model.UserFollow{}).
+				Where("follower_id = ? AND deleted_at IS NULL", uidStr).
+				Pluck("following_id", &followingIDs)
+			if len(followingIDs) == 0 {
+				// No following, return empty
+				basichttp.OK(c, gin.H{"total": 0, "items": []gin.H{}, "page": page, "page_size": size})
+				return
+			}
+			q = q.Where("author_id IN ?", followingIDs)
+		}
+		// "recommended" = all posts (excluding blocked), no additional filter
+	}
 
 	if v := c.Query("featured"); v == "true" {
 		q = q.Where("is_featured = ?", true)
@@ -228,7 +371,7 @@ func (h *PostHandler) ListPosts(c *gin.Context) {
 	}
 	basichttp.OK(c, gin.H{
 		"total":     total,
-		"items":     h.enrichPostsWithUserTags(items),
+		"items":     h.enrichPostsWithUserTagsCtx(items, c),
 		"page":      page,
 		"page_size": size,
 	})
@@ -236,6 +379,7 @@ func (h *PostHandler) ListPosts(c *gin.Context) {
 
 // GET /api/users/:id/posts (public)
 // Lists visible posts authored by the specified user.
+// Query param: type=posts|replies|reposts|likes (default: all original posts)
 func (h *PostHandler) ListByUser(c *gin.Context) {
 	userID := c.Param("id")
 	page := queryInt(c, "page", 1)
@@ -244,16 +388,58 @@ func (h *PostHandler) ListByUser(c *gin.Context) {
 		size = 100
 	}
 
+	postType := strings.TrimSpace(c.Query("type"))
+
 	var total int64
 	var items []model.Post
-	q := h.db.Model(&model.Post{}).
-		Where("author_id = ? AND status = 0 AND deleted_at IS NULL", userID)
-	q.Count(&total)
-	// User profile shows latest posts first (no priority sorting)
-	if err := q.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
-		return
+
+	switch postType {
+	case "replies":
+		q := h.db.Model(&model.Post{}).
+			Where("author_id = ? AND status = 0 AND deleted_at IS NULL AND reply_to_id IS NOT NULL", userID)
+		q.Count(&total)
+		if err := q.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+			return
+		}
+	case "reposts":
+		q := h.db.Model(&model.Post{}).
+			Where("author_id = ? AND status = 0 AND deleted_at IS NULL AND repost_of_id IS NOT NULL", userID)
+		q.Count(&total)
+		if err := q.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+			return
+		}
+	case "likes":
+		// Return posts that this user has liked
+		q := h.db.Model(&model.Post{}).
+			Joins("JOIN post_likes ON post_likes.post_id = posts.id AND post_likes.deleted_at IS NULL").
+			Where("post_likes.user_id = ? AND posts.status = 0 AND posts.deleted_at IS NULL", userID)
+		q.Count(&total)
+		if err := q.Order("post_likes.created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+			return
+		}
+	case "posts":
+		// Only original posts (no replies, no reposts)
+		q := h.db.Model(&model.Post{}).
+			Where("author_id = ? AND status = 0 AND deleted_at IS NULL AND reply_to_id IS NULL AND repost_of_id IS NULL", userID)
+		q.Count(&total)
+		if err := q.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+			return
+		}
+	default:
+		// All posts by user (original + quotes, excluding replies and reposts)
+		q := h.db.Model(&model.Post{}).
+			Where("author_id = ? AND status = 0 AND deleted_at IS NULL AND reply_to_id IS NULL AND repost_of_id IS NULL", userID)
+		q.Count(&total)
+		if err := q.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+			return
+		}
 	}
+
 	basichttp.OK(c, gin.H{"total": total, "items": h.enrichPostsWithUserTags(items), "page": page, "page_size": size})
 }
 
@@ -284,7 +470,12 @@ func (h *PostHandler) GetPost(c *gin.Context) {
 	}
 	// Count this request as a view (all requests, logged-in or not)
 	_ = h.db.Model(&model.Post{}).Where("id = ?", id).Update("view_count", gorm.Expr("view_count + 1")).Error
-	basichttp.OK(c, h.enrichPostWithUserTag(&p))
+	items := h.enrichPostsWithUserTagsCtx([]model.Post{p}, c)
+	if len(items) > 0 {
+		basichttp.OK(c, items[0])
+	} else {
+		basichttp.OK(c, h.enrichPostWithUserTag(&p))
+	}
 }
 
 func queryInt(c *gin.Context, key string, def int) int {
@@ -396,6 +587,11 @@ func getUserDisplayNameCached(userID string, nameMap map[string]string) string {
 
 // enrichPostsWithUserTags adds user tag information to multiple posts (optimized batch query)
 func (h *PostHandler) enrichPostsWithUserTags(posts []model.Post) []gin.H {
+	return h.enrichPostsWithUserTagsCtx(posts, nil)
+}
+
+// enrichPostsWithUserTagsCtx enriches posts with user tags and optionally checks like status.
+func (h *PostHandler) enrichPostsWithUserTagsCtx(posts []model.Post, c *gin.Context) []gin.H {
 	if len(posts) == 0 {
 		return []gin.H{}
 	}
@@ -466,6 +662,77 @@ func (h *PostHandler) enrichPostsWithUserTags(posts []model.Post) []gin.H {
 	}
 	displayNameMap := h.batchGetUserDisplayNames(confessorUserIDs)
 
+	// Batch query related posts (reply_to, repost_of, quote_of)
+	relatedIDs := make([]string, 0)
+	relatedIDSet := make(map[string]struct{})
+	for i := range posts {
+		for _, ptr := range []*string{posts[i].ReplyToID, posts[i].RepostOfID, posts[i].QuoteOfID} {
+			if ptr != nil && *ptr != "" {
+				if _, ok := relatedIDSet[*ptr]; !ok {
+					relatedIDSet[*ptr] = struct{}{}
+					relatedIDs = append(relatedIDs, *ptr)
+				}
+			}
+		}
+	}
+	relatedPostMap := make(map[string]*model.Post)
+	if len(relatedIDs) > 0 {
+		var relatedPosts []model.Post
+		if err := h.db.Where("id IN ?", relatedIDs).Find(&relatedPosts).Error; err == nil {
+			for i := range relatedPosts {
+				relatedPostMap[relatedPosts[i].ID] = &relatedPosts[i]
+			}
+		}
+		// Also fetch user info for related post authors
+		relatedAuthorIDs := make([]string, 0)
+		for _, rp := range relatedPostMap {
+			if !authorIDSet[rp.AuthorID] {
+				relatedAuthorIDs = append(relatedAuthorIDs, rp.AuthorID)
+				authorIDSet[rp.AuthorID] = true
+			}
+		}
+		if len(relatedAuthorIDs) > 0 {
+			var relatedUsers []model.User
+			if err := h.db.Select("id, username, display_name, avatar_url").
+				Where("id IN ? AND deleted_at IS NULL", relatedAuthorIDs).
+				Find(&relatedUsers).Error; err == nil {
+				for i := range relatedUsers {
+					userMap[relatedUsers[i].ID] = &relatedUsers[i]
+				}
+			}
+		}
+	}
+
+	// Batch query mentions
+	mentionMap := make(map[string][]gin.H)
+	if len(postIDs) > 0 {
+		var mentions []model.PostMention
+		if err := h.db.Where("post_id IN ?", postIDs).Find(&mentions).Error; err == nil {
+			for _, m := range mentions {
+				mentionMap[m.PostID] = append(mentionMap[m.PostID], gin.H{
+					"user_id":  m.MentionedUserID,
+					"username": m.Username,
+				})
+			}
+		}
+	}
+
+	// Batch query liked_by_me if user is logged in
+	likedByMe := make(map[string]bool)
+	if c != nil {
+		if uid, exists := c.Get(mw.CtxUserID); exists {
+			if uidStr, ok := uid.(string); ok && uidStr != "" {
+				var likedPostIDs []string
+				h.db.Model(&model.PostLike{}).
+					Where("user_id = ? AND post_id IN ? AND deleted_at IS NULL", uidStr, postIDs).
+					Pluck("post_id", &likedPostIDs)
+				for _, pid := range likedPostIDs {
+					likedByMe[pid] = true
+				}
+			}
+		}
+	}
+
 	result := make([]gin.H, 0, len(posts))
 	for i := range posts {
 		post := &posts[i]
@@ -509,10 +776,39 @@ func (h *PostHandler) enrichPostsWithUserTags(posts []model.Post) []gin.H {
 			"is_author_admin":         false,
 			"view_count":              post.ViewCount,
 			"comment_count":           post.CommentCount,
+			"like_count":              post.LikeCount,
+			"repost_count":            post.RepostCount,
+			"quote_count":             post.QuoteCount,
+			"reply_count":             post.ReplyCount,
+			"reply_to_id":             post.ReplyToID,
+			"repost_of_id":            post.RepostOfID,
+			"quote_of_id":             post.QuoteOfID,
 			"audit_status":            post.AuditStatus,
 			"audit_msg":               post.AuditMsg,
 			"manual_review_requested": post.ManualReviewRequested,
 			"is_pending_review":       post.AuditStatus == 1,
+			"mentions":                mentionMap[post.ID],
+			"liked_by_me":             likedByMe[post.ID],
+		}
+
+		// Add related post summaries
+		if post.ReplyToID != nil {
+			if rp, ok := relatedPostMap[*post.ReplyToID]; ok {
+				summary := h.buildPostSummary(rp, userMap)
+				item["reply_to"] = summary
+			}
+		}
+		if post.RepostOfID != nil {
+			if rp, ok := relatedPostMap[*post.RepostOfID]; ok {
+				summary := h.buildPostSummary(rp, userMap)
+				item["repost_of"] = summary
+			}
+		}
+		if post.QuoteOfID != nil {
+			if rp, ok := relatedPostMap[*post.QuoteOfID]; ok {
+				summary := h.buildPostSummary(rp, userMap)
+				item["quote_of"] = summary
+			}
 		}
 
 		if tag, ok := userTags[post.AuthorID]; ok && tag != nil {
@@ -532,7 +828,6 @@ func (h *PostHandler) enrichPostsWithUserTags(posts []model.Post) []gin.H {
 			} else if permMap[post.AuthorID] {
 				item["is_author_admin"] = true
 			}
-			// Add complete author information
 			if user.DisplayName != nil && *user.DisplayName != "" {
 				item["author_display_name"] = *user.DisplayName
 			} else {
@@ -547,6 +842,34 @@ func (h *PostHandler) enrichPostsWithUserTags(posts []model.Post) []gin.H {
 	}
 
 	return result
+}
+
+// buildPostSummary creates a lightweight summary of a related post.
+func (h *PostHandler) buildPostSummary(post *model.Post, userMap map[string]*model.User) gin.H {
+	if post == nil {
+		return nil
+	}
+	contentPreview := post.Content
+	if len([]rune(contentPreview)) > 200 {
+		contentPreview = string([]rune(contentPreview)[:200]) + "..."
+	}
+	summary := gin.H{
+		"id":          post.ID,
+		"author_id":   post.AuthorID,
+		"author_name": post.AuthorName,
+		"content":     contentPreview,
+		"created_at":  post.CreatedAt,
+	}
+	if user, ok := userMap[post.AuthorID]; ok {
+		if user.DisplayName != nil && *user.DisplayName != "" {
+			summary["author_display_name"] = *user.DisplayName
+		} else {
+			summary["author_display_name"] = user.Username
+		}
+		summary["author_avatar_url"] = user.AvatarURL
+		summary["author_username"] = user.Username
+	}
+	return summary
 }
 
 // ----- Management endpoints -----
@@ -643,11 +966,19 @@ func (h *PostHandler) View(c *gin.Context) {
 func (h *PostHandler) Stats(c *gin.Context) {
 	id := c.Param("id")
 	var p model.Post
-	if err := h.db.Select("id, view_count, comment_count").First(&p, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
+	if err := h.db.Select("id, view_count, comment_count, like_count, repost_count, quote_count, reply_count").First(&p, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
 		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found")
 		return
 	}
-	basichttp.OK(c, gin.H{"id": p.ID, "view_count": p.ViewCount, "comment_count": p.CommentCount})
+	basichttp.OK(c, gin.H{
+		"id":            p.ID,
+		"view_count":    p.ViewCount,
+		"comment_count": p.CommentCount,
+		"like_count":    p.LikeCount,
+		"repost_count":  p.RepostCount,
+		"quote_count":   p.QuoteCount,
+		"reply_count":   p.ReplyCount,
+	})
 }
 
 func (h *PostHandler) Pin(c *gin.Context) {
@@ -794,8 +1125,74 @@ func (h *PostHandler) Hide(c *gin.Context) {
 	if body.Hide {
 		newStatus = 1
 	}
-	if err := h.db.Model(&model.Post{}).Where("id = ?", id).Update("status", newStatus).Error; err != nil {
+
+	oldStatus := p.Status
+
+	tx := h.db.Begin()
+	if tx.Error != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "transaction failed")
+		return
+	}
+
+	if err := tx.Model(&model.Post{}).Where("id = ?", id).Update("status", newStatus).Error; err != nil {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
+		return
+	}
+
+	// Update parent counts based on status change
+	// If hiding (0->1): decrement counts
+	// If unhiding (1->0): increment counts
+	if oldStatus == 0 && newStatus == 1 {
+		// Hiding: decrement counts
+		if p.ReplyToID != nil && *p.ReplyToID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.ReplyToID).Update("reply_count", gorm.Expr("CASE WHEN reply_count > 0 THEN reply_count - 1 ELSE 0 END")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+		if p.RepostOfID != nil && *p.RepostOfID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.RepostOfID).Update("repost_count", gorm.Expr("CASE WHEN repost_count > 0 THEN repost_count - 1 ELSE 0 END")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+		if p.QuoteOfID != nil && *p.QuoteOfID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.QuoteOfID).Update("quote_count", gorm.Expr("CASE WHEN quote_count > 0 THEN quote_count - 1 ELSE 0 END")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+	} else if oldStatus == 1 && newStatus == 0 {
+		// Unhiding: increment counts
+		if p.ReplyToID != nil && *p.ReplyToID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.ReplyToID).Update("reply_count", gorm.Expr("reply_count + 1")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+		if p.RepostOfID != nil && *p.RepostOfID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.RepostOfID).Update("repost_count", gorm.Expr("repost_count + 1")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+		if p.QuoteOfID != nil && *p.QuoteOfID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.QuoteOfID).Update("quote_count", gorm.Expr("quote_count + 1")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
 		return
 	}
 
@@ -880,15 +1277,56 @@ func (h *PostHandler) Update(c *gin.Context) {
 		basichttp.OK(c, p)
 		return
 	}
+
+	wasVisible := p.Status == 0
+
+	tx := h.db.Begin()
+	if tx.Error != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "transaction failed")
+		return
+	}
+
 	// Apply updates and set pending moderation again
 	updates["status"] = 1
 	updates["audit_status"] = 1
 	updates["audit_msg"] = nil
 	updates["manual_review_requested"] = false
-	if err := h.db.Model(&model.Post{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+	if err := tx.Model(&model.Post{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
 		return
 	}
+
+	// If post was visible and is now pending review, decrement parent counts
+	if wasVisible {
+		if p.ReplyToID != nil && *p.ReplyToID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.ReplyToID).Update("reply_count", gorm.Expr("CASE WHEN reply_count > 0 THEN reply_count - 1 ELSE 0 END")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+		if p.RepostOfID != nil && *p.RepostOfID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.RepostOfID).Update("repost_count", gorm.Expr("CASE WHEN repost_count > 0 THEN repost_count - 1 ELSE 0 END")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+		if p.QuoteOfID != nil && *p.QuoteOfID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.QuoteOfID).Update("quote_count", gorm.Expr("CASE WHEN quote_count > 0 THEN quote_count - 1 ELSE 0 END")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+		return
+	}
+
 	// enqueue moderation
 	service.EnqueuePostModeration(id)
 	if err := h.db.First(&p, "id = ?", id).Error; err == nil {
@@ -930,7 +1368,7 @@ func (h *PostHandler) Delete(c *gin.Context) {
 			}
 		}
 	}
-	// Hard delete: remove post and its comments and images in a transaction
+	// Hard delete: remove post and its comments, images, likes, mentions in a transaction
 	tx := h.db.Begin()
 	if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.Comment{}).Error; err != nil {
 		tx.Rollback()
@@ -941,6 +1379,44 @@ func (h *PostHandler) Delete(c *gin.Context) {
 		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
 		return
+	}
+	if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.PostLike{}).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+		return
+	}
+	if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.PostMention{}).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+		return
+	}
+	if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.PostView{}).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+		return
+	}
+	// Decrement parent reply_count if this was a reply
+	if p.ReplyToID != nil && *p.ReplyToID != "" && p.Status == 0 {
+		if err := tx.Model(&model.Post{}).Where("id = ?", *p.ReplyToID).Update("reply_count", gorm.Expr("CASE WHEN reply_count > 0 THEN reply_count - 1 ELSE 0 END")).Error; err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+			return
+		}
+	}
+	// Decrement repost/quote counts (only if post was visible)
+	if p.RepostOfID != nil && *p.RepostOfID != "" && p.Status == 0 {
+		if err := tx.Model(&model.Post{}).Where("id = ?", *p.RepostOfID).Update("repost_count", gorm.Expr("CASE WHEN repost_count > 0 THEN repost_count - 1 ELSE 0 END")).Error; err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+			return
+		}
+	}
+	if p.QuoteOfID != nil && *p.QuoteOfID != "" && p.Status == 0 {
+		if err := tx.Model(&model.Post{}).Where("id = ?", *p.QuoteOfID).Update("quote_count", gorm.Expr("CASE WHEN quote_count > 0 THEN quote_count - 1 ELSE 0 END")).Error; err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+			return
+		}
 	}
 	if err := tx.Unscoped().Delete(&p).Error; err != nil {
 		tx.Rollback()
@@ -1142,4 +1618,318 @@ func ensureText(val, fallback string) string {
 		return fallback
 	}
 	return val
+}
+
+// ===== X-style new endpoints =====
+
+// GET /api/posts/:id/replies (public)
+// Returns direct replies to a post.
+func (h *PostHandler) ListReplies(c *gin.Context) {
+	postID := c.Param("id")
+	// Ensure parent post exists
+	var parent model.Post
+	if err := h.db.First(&parent, "id = ? AND deleted_at IS NULL", postID).Error; err != nil {
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found")
+		return
+	}
+
+	page := queryInt(c, "page", 1)
+	size := queryInt(c, "page_size", 20)
+	if size > 100 {
+		size = 100
+	}
+
+	var total int64
+	var items []model.Post
+	q := h.db.Model(&model.Post{}).
+		Where("reply_to_id = ? AND status = 0 AND deleted_at IS NULL", postID)
+	q.Count(&total)
+	if err := q.Order("created_at ASC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+		return
+	}
+	basichttp.OK(c, gin.H{"total": total, "items": h.enrichPostsWithUserTagsCtx(items, c), "page": page, "page_size": size})
+}
+
+// GET /api/posts/:id/thread (public)
+// Returns the full conversation thread by walking up the reply chain.
+func (h *PostHandler) GetThread(c *gin.Context) {
+	postID := c.Param("id")
+	var current model.Post
+	if err := h.db.First(&current, "id = ? AND deleted_at IS NULL", postID).Error; err != nil {
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found")
+		return
+	}
+
+	// Walk up the reply chain (max 50 levels)
+	chain := []model.Post{current}
+	visited := map[string]bool{current.ID: true}
+	cursor := &current
+	for i := 0; i < 50; i++ {
+		if cursor.ReplyToID == nil || *cursor.ReplyToID == "" {
+			break
+		}
+		if visited[*cursor.ReplyToID] {
+			break
+		}
+		var parent model.Post
+		if err := h.db.First(&parent, "id = ? AND deleted_at IS NULL", *cursor.ReplyToID).Error; err != nil {
+			break
+		}
+		visited[parent.ID] = true
+		chain = append(chain, parent)
+		cursor = &chain[len(chain)-1]
+	}
+
+	// Reverse so oldest ancestor is first
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+
+	basichttp.OK(c, gin.H{
+		"thread": h.enrichPostsWithUserTagsCtx(chain, c),
+		"count":  len(chain),
+	})
+}
+
+// POST /api/posts/:id/like (auth)
+func (h *PostHandler) LikePost(c *gin.Context) {
+	postID := c.Param("id")
+	uid, _ := c.Get(mw.CtxUserID)
+	uidStr := uid.(string)
+
+	var p model.Post
+	if err := h.db.First(&p, "id = ? AND deleted_at IS NULL AND status = 0", postID).Error; err != nil {
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found")
+		return
+	}
+
+	// Check if already liked
+	var existing model.PostLike
+	if err := h.db.Where("user_id = ? AND post_id = ? AND deleted_at IS NULL", uidStr, postID).First(&existing).Error; err == nil {
+		basichttp.OK(c, gin.H{"liked": true, "message": "already liked"})
+		return
+	}
+
+	tx := h.db.Begin()
+	if tx.Error != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "transaction failed")
+		return
+	}
+
+	like := &model.PostLike{UserID: uidStr, PostID: postID}
+	if err := tx.Create(like).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "like failed")
+		return
+	}
+	if err := tx.Model(&model.Post{}).Where("id = ?", postID).Update("like_count", gorm.Expr("like_count + 1")).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+		return
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+		return
+	}
+
+	// Notify post author
+	if p.AuthorID != uidStr {
+		service.Notify(h.db, p.AuthorID, "有人点赞了你的帖子", "你的帖子收到了一个赞。", map[string]any{
+			"post_id": postID,
+			"liker":   uidStr,
+			"type":    "like",
+		})
+	}
+
+	basichttp.OK(c, gin.H{"liked": true})
+}
+
+// DELETE /api/posts/:id/like (auth)
+func (h *PostHandler) UnlikePost(c *gin.Context) {
+	postID := c.Param("id")
+	uid, _ := c.Get(mw.CtxUserID)
+	uidStr := uid.(string)
+
+	tx := h.db.Begin()
+	if tx.Error != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "transaction failed")
+		return
+	}
+
+	result := tx.Unscoped().Where("user_id = ? AND post_id = ?", uidStr, postID).Delete(&model.PostLike{})
+	if result.Error != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "unlike failed")
+		return
+	}
+	if result.RowsAffected > 0 {
+		if err := tx.Model(&model.Post{}).Where("id = ?", postID).Update("like_count", gorm.Expr("CASE WHEN like_count > 0 THEN like_count - 1 ELSE 0 END")).Error; err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+			return
+		}
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+		return
+	}
+
+	basichttp.OK(c, gin.H{"liked": false})
+}
+
+// GET /api/posts/:id/likes (public)
+func (h *PostHandler) ListLikes(c *gin.Context) {
+	postID := c.Param("id")
+	page := queryInt(c, "page", 1)
+	size := queryInt(c, "page_size", 20)
+	if size > 100 {
+		size = 100
+	}
+
+	var total int64
+	h.db.Model(&model.PostLike{}).Where("post_id = ? AND deleted_at IS NULL", postID).Count(&total)
+
+	var likes []model.PostLike
+	if err := h.db.Where("post_id = ? AND deleted_at IS NULL", postID).
+		Order("created_at DESC").Offset((page - 1) * size).Limit(size).
+		Find(&likes).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+		return
+	}
+
+	userIDs := make([]string, len(likes))
+	for i, l := range likes {
+		userIDs[i] = l.UserID
+	}
+
+	userMap := make(map[string]*model.User)
+	if len(userIDs) > 0 {
+		var users []model.User
+		h.db.Select("id, username, display_name, avatar_url").
+			Where("id IN ? AND deleted_at IS NULL", userIDs).Find(&users)
+		for i := range users {
+			userMap[users[i].ID] = &users[i]
+		}
+	}
+
+	items := make([]gin.H, 0, len(likes))
+	for _, l := range likes {
+		item := gin.H{"user_id": l.UserID, "liked_at": l.CreatedAt}
+		if u, ok := userMap[l.UserID]; ok {
+			item["username"] = u.Username
+			if u.DisplayName != nil {
+				item["display_name"] = *u.DisplayName
+			}
+			item["avatar_url"] = u.AvatarURL
+		}
+		items = append(items, item)
+	}
+
+	basichttp.OK(c, gin.H{"total": total, "items": items, "page": page, "page_size": size})
+}
+
+// GET /api/posts/:id/like-status (auth)
+func (h *PostHandler) LikeStatus(c *gin.Context) {
+	postID := c.Param("id")
+	uid, _ := c.Get(mw.CtxUserID)
+	uidStr := uid.(string)
+
+	var count int64
+	h.db.Model(&model.PostLike{}).Where("user_id = ? AND post_id = ? AND deleted_at IS NULL", uidStr, postID).Count(&count)
+	basichttp.OK(c, gin.H{"liked": count > 0})
+}
+
+// GET /api/my/likes (auth)
+func (h *PostHandler) ListMyLikes(c *gin.Context) {
+	uid, _ := c.Get(mw.CtxUserID)
+	uidStr := uid.(string)
+	page := queryInt(c, "page", 1)
+	size := queryInt(c, "page_size", 20)
+	if size > 100 {
+		size = 100
+	}
+
+	var total int64
+	var items []model.Post
+	q := h.db.Model(&model.Post{}).
+		Joins("JOIN post_likes ON post_likes.post_id = posts.id AND post_likes.deleted_at IS NULL").
+		Where("post_likes.user_id = ? AND posts.status = 0 AND posts.deleted_at IS NULL", uidStr)
+	q.Count(&total)
+	if err := q.Order("post_likes.created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+		return
+	}
+	basichttp.OK(c, gin.H{"total": total, "items": h.enrichPostsWithUserTagsCtx(items, c), "page": page, "page_size": size})
+}
+
+// GET /api/users/by-username/:username/posts (public)
+func (h *PostHandler) ListByUsername(c *gin.Context) {
+	username := c.Param("username")
+	var user model.User
+	if err := h.db.Select("id").First(&user, "username = ? AND deleted_at IS NULL", username).Error; err != nil {
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "user not found")
+		return
+	}
+	// Manually call the same logic as ListByUser with the resolved user ID
+	page := queryInt(c, "page", 1)
+	size := queryInt(c, "page_size", 20)
+	if size > 100 {
+		size = 100
+	}
+	postType := strings.TrimSpace(c.Query("type"))
+	userID := user.ID
+
+	var total int64
+	var items []model.Post
+
+	switch postType {
+	case "replies":
+		q := h.db.Model(&model.Post{}).
+			Where("author_id = ? AND status = 0 AND deleted_at IS NULL AND reply_to_id IS NOT NULL", userID)
+		q.Count(&total)
+		q.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items)
+	case "reposts":
+		q := h.db.Model(&model.Post{}).
+			Where("author_id = ? AND status = 0 AND deleted_at IS NULL AND repost_of_id IS NOT NULL", userID)
+		q.Count(&total)
+		q.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items)
+	case "likes":
+		q := h.db.Model(&model.Post{}).
+			Joins("JOIN post_likes ON post_likes.post_id = posts.id AND post_likes.deleted_at IS NULL").
+			Where("post_likes.user_id = ? AND posts.status = 0 AND posts.deleted_at IS NULL", userID)
+		q.Count(&total)
+		q.Order("post_likes.created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items)
+	default:
+		q := h.db.Model(&model.Post{}).
+			Where("author_id = ? AND status = 0 AND deleted_at IS NULL AND reply_to_id IS NULL AND repost_of_id IS NULL", userID)
+		q.Count(&total)
+		q.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items)
+	}
+
+	basichttp.OK(c, gin.H{"total": total, "items": h.enrichPostsWithUserTags(items), "page": page, "page_size": size})
+}
+
+// GET /api/users/:id/replies (public)
+// Returns user's replies with parent post summaries.
+func (h *PostHandler) ListUserReplies(c *gin.Context) {
+	userID := c.Param("id")
+	page := queryInt(c, "page", 1)
+	size := queryInt(c, "page_size", 20)
+	if size > 100 {
+		size = 100
+	}
+
+	var total int64
+	var items []model.Post
+	q := h.db.Model(&model.Post{}).
+		Where("author_id = ? AND status = 0 AND deleted_at IS NULL AND reply_to_id IS NOT NULL", userID)
+	q.Count(&total)
+	if err := q.Order("created_at DESC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
+		return
+	}
+	basichttp.OK(c, gin.H{"total": total, "items": h.enrichPostsWithUserTagsCtx(items, c), "page": page, "page_size": size})
 }

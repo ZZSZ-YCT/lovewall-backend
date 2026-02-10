@@ -43,23 +43,26 @@ func (base *BaseModel) BeforeCreate(tx *gorm.DB) error {
 
 type User struct {
 	BaseModel
-	Username      string     `gorm:"uniqueIndex;not null" json:"username"`
-	DisplayName   *string    `json:"display_name"`
-	Email         *string    `gorm:"uniqueIndex" json:"email,omitempty"`
-	Phone         *string    `gorm:"uniqueIndex" json:"phone,omitempty"`
-	AvatarURL     *string    `json:"avatar_url,omitempty"`
-	Bio           *string    `json:"bio,omitempty"`
-	PasswordHash  string     `json:"-"`
-	IsSuperadmin  bool       `gorm:"not null;default:false" json:"is_superadmin"`
-	Status        int        `gorm:"not null;default:0" json:"status"`
-	IsBanned      bool       `gorm:"not null;default:false;index" json:"is_banned"`
-	BanReason     *string    `json:"ban_reason,omitempty"`
-	BannedAt      *time.Time `json:"banned_at,omitempty"`
-	LastLoginAt   *time.Time `json:"last_login_at,omitempty"`
-	IsOnline      bool       `gorm:"not null;default:false;index" json:"is_online"`
-	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
-	LastIP        *string    `json:"last_ip,omitempty"`
-	Metadata      *string    `json:"metadata,omitempty"`
+	Username       string     `gorm:"uniqueIndex;not null" json:"username"`
+	DisplayName    *string    `json:"display_name"`
+	Email          *string    `gorm:"uniqueIndex" json:"email,omitempty"`
+	Phone          *string    `gorm:"uniqueIndex" json:"phone,omitempty"`
+	AvatarURL      *string    `json:"avatar_url,omitempty"`
+	BannerURL      *string    `json:"banner_url,omitempty"`
+	Bio            *string    `json:"bio,omitempty"`
+	PasswordHash   string     `json:"-"`
+	IsSuperadmin   bool       `gorm:"not null;default:false" json:"is_superadmin"`
+	Status         int        `gorm:"not null;default:0" json:"status"`
+	IsBanned       bool       `gorm:"not null;default:false;index" json:"is_banned"`
+	BanReason      *string    `json:"ban_reason,omitempty"`
+	BannedAt       *time.Time `json:"banned_at,omitempty"`
+	LastLoginAt    *time.Time `json:"last_login_at,omitempty"`
+	IsOnline       bool       `gorm:"not null;default:false;index" json:"is_online"`
+	LastHeartbeat  *time.Time `json:"last_heartbeat,omitempty"`
+	LastIP         *string    `json:"last_ip,omitempty"`
+	Metadata       *string    `json:"metadata,omitempty"`
+	FollowerCount  int        `gorm:"not null;default:0" json:"follower_count"`
+	FollowingCount int        `gorm:"not null;default:0" json:"following_count"`
 }
 
 type ExternalIdentity struct {
@@ -92,9 +95,18 @@ type Post struct {
 	CardType      *string `gorm:"not null;default:confession;index" json:"card_type"`
 	Metadata      *string `json:"metadata,omitempty"`
 
+	// X-style fields: reply, repost, quote
+	ReplyToID  *string `gorm:"index" json:"reply_to_id"`
+	RepostOfID *string `gorm:"index" json:"repost_of_id"`
+	QuoteOfID  *string `gorm:"index" json:"quote_of_id"`
+
 	// Stats
 	ViewCount    int `gorm:"not null;default:0" json:"view_count"`
 	CommentCount int `gorm:"not null;default:0" json:"comment_count"`
+	LikeCount    int `gorm:"not null;default:0" json:"like_count"`
+	RepostCount  int `gorm:"not null;default:0" json:"repost_count"`
+	QuoteCount   int `gorm:"not null;default:0" json:"quote_count"`
+	ReplyCount   int `gorm:"not null;default:0" json:"reply_count"`
 
 	// Moderation
 	AuditStatus           int     `gorm:"not null;default:0" json:"audit_status"` // 0=approved,1=pending,2=rejected
@@ -108,6 +120,35 @@ type PostImage struct {
 	PostID    string `gorm:"index;not null" json:"post_id"`
 	URL       string `gorm:"not null" json:"url"`
 	SortOrder int    `gorm:"not null;default:0;index" json:"sort_order"`
+}
+
+// PostLike records a user liking a post
+type PostLike struct {
+	BaseModel
+	UserID string `gorm:"index:uniq_user_post_like,unique;not null" json:"user_id"`
+	PostID string `gorm:"index:uniq_user_post_like,unique;not null" json:"post_id"`
+}
+
+// PostMention records @mentions in a post
+type PostMention struct {
+	BaseModel
+	PostID          string `gorm:"index;not null" json:"post_id"`
+	MentionedUserID string `gorm:"index;not null" json:"mentioned_user_id"`
+	Username        string `gorm:"not null" json:"username"`
+}
+
+// UserFollow records follow relationships (follower_id follows following_id)
+type UserFollow struct {
+	BaseModel
+	FollowerID  string `gorm:"index:uniq_follower_following,unique;not null" json:"follower_id"`
+	FollowingID string `gorm:"index:uniq_follower_following,unique;not null" json:"following_id"`
+}
+
+// UserBlock records block relationships (blocker_id blocks blocked_id)
+type UserBlock struct {
+	BaseModel
+	BlockerID string `gorm:"index:uniq_blocker_blocked,unique;not null" json:"blocker_id"`
+	BlockedID string `gorm:"index:uniq_blocker_blocked,unique;not null" json:"blocked_id"`
 }
 
 type Comment struct {

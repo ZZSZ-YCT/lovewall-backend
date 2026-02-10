@@ -363,12 +363,68 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 			return
 		}
 	}
-	if err := h.db.Delete(&user).Error; err != nil {
+	// Use transaction to ensure atomicity
+	tx := h.db.Begin()
+	if tx.Error != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "transaction failed")
+		return
+	}
+
+	// Clean up follow relationships where user is follower
+	var followingIDs []string
+	tx.Model(&model.UserFollow{}).Where("follower_id = ? AND deleted_at IS NULL", id).Pluck("following_id", &followingIDs)
+	if len(followingIDs) > 0 {
+		if err := tx.Unscoped().Where("follower_id = ?", id).Delete(&model.UserFollow{}).Error; err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "cleanup failed")
+			return
+		}
+		// Decrement follower_count for users this user was following
+		for _, fid := range followingIDs {
+			_ = tx.Model(&model.User{}).Where("id = ?", fid).Update("follower_count", gorm.Expr("CASE WHEN follower_count > 0 THEN follower_count - 1 ELSE 0 END")).Error
+		}
+	}
+
+	// Clean up follow relationships where user is being followed
+	var followerIDs []string
+	tx.Model(&model.UserFollow{}).Where("following_id = ? AND deleted_at IS NULL", id).Pluck("follower_id", &followerIDs)
+	if len(followerIDs) > 0 {
+		if err := tx.Unscoped().Where("following_id = ?", id).Delete(&model.UserFollow{}).Error; err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "cleanup failed")
+			return
+		}
+		// Decrement following_count for users who were following this user
+		for _, fid := range followerIDs {
+			_ = tx.Model(&model.User{}).Where("id = ?", fid).Update("following_count", gorm.Expr("CASE WHEN following_count > 0 THEN following_count - 1 ELSE 0 END")).Error
+		}
+	}
+
+	// Clean up block relationships (both as blocker and blocked)
+	if err := tx.Unscoped().Where("blocker_id = ? OR blocked_id = ?", id, id).Delete(&model.UserBlock{}).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "cleanup failed")
+		return
+	}
+
+	// Soft delete user (sets deleted_at)
+	if err := tx.Delete(&user).Error; err != nil {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
 		return
 	}
+
 	// Revoke sessions
-	_ = h.db.Where("user_id = ?", id).Delete(&model.UserSession{}).Error
+	if err := tx.Where("user_id = ?", id).Delete(&model.UserSession{}).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+		return
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+		return
+	}
 	// Log operation
 	if uid, ok := c.Get(mw.CtxUserID); ok {
 		if uidStr, ok2 := uid.(string); ok2 {
@@ -438,11 +494,60 @@ func (h *AdminHandler) ApprovePost(c *gin.Context) {
 			return
 		}
 	}
+
+	tx := h.db.Begin()
+	if tx.Error != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "transaction failed")
+		return
+	}
+
+	// Fetch post to check if it was previously hidden (inside transaction to prevent race)
+	var p model.Post
+	if err := tx.First(&p, "id = ? AND deleted_at IS NULL", id).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "post not found")
+		return
+	}
+
+	wasHidden := p.Status != 0
+
 	updates := map[string]any{"status": 0, "audit_status": 0, "audit_msg": nil, "manual_review_requested": false}
-	if err := h.db.Model(&model.Post{}).Where("id = ? AND deleted_at IS NULL", id).Updates(updates).Error; err != nil {
+	if err := tx.Model(&model.Post{}).Where("id = ? AND deleted_at IS NULL", id).Updates(updates).Error; err != nil {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "approve failed")
 		return
 	}
+
+	// If post was previously hidden, increment parent counts
+	if wasHidden {
+		if p.ReplyToID != nil && *p.ReplyToID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.ReplyToID).Update("reply_count", gorm.Expr("reply_count + 1")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+		if p.RepostOfID != nil && *p.RepostOfID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.RepostOfID).Update("repost_count", gorm.Expr("repost_count + 1")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+		if p.QuoteOfID != nil && *p.QuoteOfID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.QuoteOfID).Update("quote_count", gorm.Expr("quote_count + 1")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+		return
+	}
+
 	basichttp.OK(c, gin.H{"id": id, "approved": true})
 }
 
@@ -472,14 +577,57 @@ func (h *AdminHandler) RejectPost(c *gin.Context) {
 		return
 	}
 
+	wasVisible := p.Status == 0
+
 	// Hard delete post and related data
 	tx := h.db.Begin()
+
+	// If post was visible, decrement parent counts before deletion
+	if wasVisible {
+		if p.ReplyToID != nil && *p.ReplyToID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.ReplyToID).Update("reply_count", gorm.Expr("CASE WHEN reply_count > 0 THEN reply_count - 1 ELSE 0 END")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+		if p.RepostOfID != nil && *p.RepostOfID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.RepostOfID).Update("repost_count", gorm.Expr("CASE WHEN repost_count > 0 THEN repost_count - 1 ELSE 0 END")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+		if p.QuoteOfID != nil && *p.QuoteOfID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.QuoteOfID).Update("quote_count", gorm.Expr("CASE WHEN quote_count > 0 THEN quote_count - 1 ELSE 0 END")).Error; err != nil {
+				tx.Rollback()
+				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+				return
+			}
+		}
+	}
+
 	if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.Comment{}).Error; err != nil {
 		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
 		return
 	}
 	if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.PostImage{}).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+		return
+	}
+	if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.PostLike{}).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+		return
+	}
+	if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.PostMention{}).Error; err != nil {
+		tx.Rollback()
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
+		return
+	}
+	if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.PostView{}).Error; err != nil {
 		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "delete failed")
 		return

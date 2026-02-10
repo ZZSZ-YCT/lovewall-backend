@@ -105,12 +105,12 @@ func main() {
 	authH := handler.NewAuthHandler(database, cfg, cacheSvc, captchaSvc)
 	postH := handler.NewPostHandler(database, cfg)
 	annH := handler.NewAnnouncementHandler(database, cfg)
-	cmtH := handler.NewCommentHandler(database, cfg)
 	adminH := handler.NewAdminHandler(database, cfg, cacheSvc)
 	tagH := handler.NewTagHandler(database, cfg)
 	logH := handler.NewLogHandler(database, cfg)
 	notifyH := handler.NewNotifyHandler(database, cfg)
 	onlineH := handler.NewOnlineHandler(database, cfg)
+	followH := handler.NewFollowHandler(database, cfg)
 
 	api.GET("/captcha/generate", captchaH.Generate)
 	api.POST("/register", authH.Register)
@@ -127,12 +127,19 @@ func main() {
 	api.GET("/users/by-username/:username/active-tag", authH.GetUserActiveTagByUsername)
 	// Public: fetch user's online status
 	api.GET("/users/:id/online", onlineH.GetUserOnlineStatus)
+	// Public: follow/follower lists
+	api.GET("/users/:id/followers", followH.ListFollowers)
+	api.GET("/users/:id/following", followH.ListFollowing)
 	api.GET("/posts", postH.ListPosts)
 	api.GET("/posts/:id", postH.GetPost)
 	api.GET("/posts/:id/lock-status", postH.GetPostLockStatus)
 	api.GET("/users/:id/posts", postH.ListByUser)
+	api.GET("/users/by-username/:username/posts", postH.ListByUsername)
+	api.GET("/users/:id/replies", postH.ListUserReplies)
 	api.GET("/posts/:id/stats", postH.Stats)
-	api.GET("/posts/:id/comments", cmtH.ListForPost)
+	api.GET("/posts/:id/replies", postH.ListReplies)
+	api.GET("/posts/:id/thread", postH.GetThread)
+	api.GET("/posts/:id/likes", postH.ListLikes)
 	api.GET("/announcements", annH.List)
 	api.GET("/announcements/by-path/*path", annH.GetByPath)
 	api.GET("/tags", tagH.ListTags)
@@ -144,6 +151,7 @@ func main() {
 	authed.PATCH("/profile", authH.UpdateProfile)
 	authed.PUT("/me/password", authH.ChangeMyPassword)
 	authed.GET("/users/me/online", authH.OnlineStatus)
+	authed.GET("/users/mention-search", authH.MentionSearch)
 	authed.POST("/heartbeat", authH.Heartbeat)
 	// Note: Logout is already exposed at /api/logout (public).
 	// The handler supports token extraction and blacklist, so a second
@@ -160,6 +168,11 @@ func main() {
 	// Edit post: author within 15min or MANAGE_POSTS
 	authed.PUT("/posts/:id", postH.Update)
 	authed.DELETE("/posts/:id", postH.Delete)
+	// Like endpoints
+	authed.POST("/posts/:id/like", postH.LikePost)
+	authed.DELETE("/posts/:id/like", postH.UnlikePost)
+	authed.GET("/posts/:id/like-status", postH.LikeStatus)
+	authed.GET("/my/likes", postH.ListMyLikes)
 	authed.POST("/posts/:id/pin", mw.RequirePerm(database, "MANAGE_FEATURED"), postH.Pin)
 	authed.POST("/posts/:id/feature", mw.RequirePerm(database, "MANAGE_FEATURED"), postH.Feature)
 	authed.POST("/posts/:id/hide", mw.RequirePerm(database, "MANAGE_POSTS"), postH.Hide)
@@ -174,8 +187,7 @@ func main() {
 	authed.POST("/admin/posts/:id/reject", adminH.RejectPost)
 	authed.POST("/admin/posts/:id/lock", mw.RequirePerm(database, "MANAGE_POSTS"), postH.LockPost)
 	authed.POST("/admin/posts/:id/unlock", mw.RequirePerm(database, "MANAGE_POSTS"), postH.UnlockPost)
-	authed.POST("/admin/comments/:id/pin", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.PinComment)
-	authed.POST("/admin/comments/:id/unpin", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.UnpinComment)
+	// Comment routes removed (migrated to X-style post replies)
 
 	authed.GET("/users", mw.RequirePerm(database, "MANAGE_USERS"), adminH.ListUsers)
 	authed.PUT("/users/:id", authH.UpdateUser)
@@ -186,19 +198,7 @@ func main() {
 	authed.DELETE("/admin/users/:id", adminH.DeleteUser)
 	authed.GET("/admin/metrics/overview", adminH.MetricsOverview)
 
-	// Behavior rate-limit and quotas from env
-	authed.POST(
-		"/posts/:id/comments",
-		mw.LimitAction("comment_create", cfg.ActionCommentCount, time.Duration(cfg.ActionCommentWindowSec)*time.Second),
-		mw.EnforceCommentHourlyQuota(database, cfg.QuotaCommentsPerUserPerHour, cfg.QuotaCommentsPerIPPerHour),
-		cmtH.Create,
-	)
-	authed.DELETE("/comments/:id", cmtH.Delete)
-	// Edit comment: author within 15min or MANAGE_POSTS
-	authed.PUT("/comments/:id", cmtH.Update)
-	authed.POST("/comments/:id/hide", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.Hide)
-	authed.GET("/my/comments", cmtH.ListMine)
-	authed.GET("/comments", mw.RequirePerm(database, "MANAGE_POSTS"), cmtH.ListModeration)
+	// Comment routes removed (migrated to X-style post replies)
 
 	// Tag and Redemption Code APIs
 	authed.POST("/tags", mw.RequirePerm(database, "MANAGE_TAGS"), tagH.CreateTag)
@@ -229,6 +229,16 @@ func main() {
 	authed.GET("/notifications", notifyH.List)
 	authed.GET("/notifications/unread-count", notifyH.UnreadCount)
 	authed.POST("/notifications/:id/read", notifyH.MarkRead)
+	// Follow/Block
+	authed.POST("/users/:id/follow", followH.FollowUser)
+	authed.DELETE("/users/:id/follow", followH.UnfollowUser)
+	authed.GET("/users/:id/follow-status", followH.FollowStatus)
+	authed.POST("/users/:id/block", followH.BlockUser)
+	authed.DELETE("/users/:id/block", followH.UnblockUser)
+	authed.GET("/users/:id/blocks", followH.ListBlocks)
+	authed.GET("/users/:id/block-status", followH.BlockStatus)
+	authed.POST("/users/follow-status/batch", followH.FollowStatusBatch)
+	authed.POST("/users/block-status/batch", followH.BlockStatusBatch)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
 	if err := http.ListenAndServe(addr, r); err != nil {

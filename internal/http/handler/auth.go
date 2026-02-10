@@ -522,26 +522,29 @@ func sanitizeUserCached(u *model.User, isAdmin bool) gin.H {
 		return gin.H{}
 	}
 	return gin.H{
-		"id":             u.ID,
-		"username":       u.Username,
-		"display_name":   u.DisplayName,
-		"email":          u.Email,
-		"phone":          u.Phone,
-		"avatar_url":     u.AvatarURL,
-		"bio":            u.Bio,
-		"is_superadmin":  u.IsSuperadmin,
-		"status":         u.Status,
-		"is_banned":      u.IsBanned,
-		"ban_reason":     u.BanReason,
-		"last_login_at":  u.LastLoginAt,
-		"last_ip":        u.LastIP,
-		"is_online":      u.IsOnline,
-		"last_heartbeat": u.LastHeartbeat,
-		"metadata":       u.Metadata,
-		"created_at":     u.CreatedAt,
-		"updated_at":     u.UpdatedAt,
-		"is_deleted":     u.DeletedAt != nil,
-		"is_admin":       isAdmin,
+		"id":              u.ID,
+		"username":        u.Username,
+		"display_name":    u.DisplayName,
+		"email":           u.Email,
+		"phone":           u.Phone,
+		"avatar_url":      u.AvatarURL,
+		"banner_url":      u.BannerURL,
+		"bio":             u.Bio,
+		"is_superadmin":   u.IsSuperadmin,
+		"status":          u.Status,
+		"is_banned":       u.IsBanned,
+		"ban_reason":      u.BanReason,
+		"last_login_at":   u.LastLoginAt,
+		"last_ip":         u.LastIP,
+		"is_online":       u.IsOnline,
+		"last_heartbeat":  u.LastHeartbeat,
+		"metadata":        u.Metadata,
+		"follower_count":  u.FollowerCount,
+		"following_count": u.FollowingCount,
+		"created_at":      u.CreatedAt,
+		"updated_at":      u.UpdatedAt,
+		"is_deleted":      u.DeletedAt != nil,
+		"is_admin":        isAdmin,
 	}
 }
 
@@ -575,17 +578,21 @@ func sanitizeUserPublic(db *gorm.DB, u *model.User) gin.H {
 	}
 
 	result := gin.H{
-		"id":             u.ID,
-		"username":       u.Username,
-		"display_name":   u.DisplayName,
-		"avatar_url":     u.AvatarURL,
-		"status":         u.Status,
-		"is_online":      u.IsOnline,
-		"last_heartbeat": u.LastHeartbeat,
-		"created_at":     u.CreatedAt,
-		"updated_at":     u.UpdatedAt,
-		"is_deleted":     u.DeletedAt != nil,
-		"is_admin":       hasAnyAdminPermission(db, u.ID),
+		"id":              u.ID,
+		"username":        u.Username,
+		"display_name":    u.DisplayName,
+		"avatar_url":      u.AvatarURL,
+		"banner_url":      u.BannerURL,
+		"bio":             u.Bio,
+		"status":          u.Status,
+		"is_online":       u.IsOnline,
+		"last_heartbeat":  u.LastHeartbeat,
+		"follower_count":  u.FollowerCount,
+		"following_count": u.FollowingCount,
+		"created_at":      u.CreatedAt,
+		"updated_at":      u.UpdatedAt,
+		"is_deleted":      u.DeletedAt != nil,
+		"is_admin":        hasAnyAdminPermission(db, u.ID),
 	}
 
 	// Add active tag
@@ -890,11 +897,12 @@ func (h *AuthHandler) UpdateUser(c *gin.Context) {
 // PATCH /api/profile (auth)
 // Updates current user's profile, including optional Base64 avatar upload.
 type UpdateProfileRequest struct {
-	DisplayName  *string `json:"display_name"`
-	Email        *string `json:"email"`
-	Phone        *string `json:"phone"`
-	Bio          *string `json:"bio"`
-	AvatarBase64 *string `json:"avatar_base64"`
+	DisplayName   *string `json:"display_name"`
+	Email         *string `json:"email"`
+	Phone         *string `json:"phone"`
+	Bio           *string `json:"bio"`
+	AvatarBase64  *string `json:"avatar_base64"`
+	BannerBase64  *string `json:"banner_base64"`
 }
 
 func (h *AuthHandler) UpdateProfile(c *gin.Context) {
@@ -1065,6 +1073,63 @@ func (h *AuthHandler) UpdateProfile(c *gin.Context) {
 		}
 	}
 
+	// Handle banner upload if provided
+	var oldBannerPathToDelete string
+	if req.BannerBase64 != nil && *req.BannerBase64 != "" {
+		s := *req.BannerBase64
+		if !strings.HasPrefix(s, "data:image/") || !strings.Contains(s, ";base64,") {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid banner base64 format")
+			return
+		}
+		parts := strings.SplitN(s, ",", 2)
+		if len(parts) != 2 {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid banner base64 format")
+			return
+		}
+		dataPart := parts[1]
+		dataPart = strings.TrimSpace(dataPart)
+		raw, err := base64.StdEncoding.DecodeString(dataPart)
+		if err != nil {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "invalid base64 data")
+			return
+		}
+		if len(raw) > 10*1024*1024 {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "banner too large (max 10MB)")
+			return
+		}
+		probe := raw
+		if len(probe) > 512 {
+			probe = probe[:512]
+		}
+		mime := http.DetectContentType(probe)
+		ext := storage.ExtFromMIME(mime)
+		if ext == "" {
+			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "unsupported banner format")
+			return
+		}
+		ts := time.Now().UnixMilli()
+		savedName := filepath.ToSlash(filepath.Join("banners", userID+"-"+fmtInt64(ts)+ext))
+		lp := &storage.LocalProvider{BaseDir: h.cfg.UploadDir}
+		if _, err := lp.Save(c, bytes.NewReader(raw), savedName); err != nil {
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "save banner failed")
+			return
+		}
+		url := storage.JoinURL(h.cfg.UploadBaseURL, savedName)
+		updates["banner_url"] = &url
+		if user.BannerURL != nil && *user.BannerURL != "" {
+			rel := strings.TrimPrefix(*user.BannerURL, h.cfg.UploadBaseURL)
+			if strings.HasPrefix(rel, "/") {
+				rel = rel[1:]
+			}
+			oldPath := filepath.Join(h.cfg.UploadDir, rel)
+			base := filepath.Clean(h.cfg.UploadDir)
+			target := filepath.Clean(oldPath)
+			if strings.HasPrefix(target, base+string(os.PathSeparator)) || target == base {
+				oldBannerPathToDelete = target
+			}
+		}
+	}
+
 	if len(updates) == 0 {
 		basichttp.OK(c, sanitizeUser(h.db, &user))
 		return
@@ -1084,6 +1149,10 @@ func (h *AuthHandler) UpdateProfile(c *gin.Context) {
 	// Best-effort delete of previous avatar
 	if oldAvatarPathToDelete != "" {
 		_ = os.Remove(oldAvatarPathToDelete)
+	}
+	// Best-effort delete of previous banner
+	if oldBannerPathToDelete != "" {
+		_ = os.Remove(oldBannerPathToDelete)
 	}
 	basichttp.OK(c, sanitizeUser(h.db, &user))
 }
@@ -1594,4 +1663,41 @@ func (h *AuthHandler) GetUserActiveTagByUsername(c *gin.Context) {
 		"text_color":       tag.TextColor,
 		"user_deleted":     u.DeletedAt != nil,
 	})
+}
+
+// GET /api/users/mention-search?q=xxx (auth)
+// Lightweight user search for @mention autocomplete.
+func (h *AuthHandler) MentionSearch(c *gin.Context) {
+	q := strings.TrimSpace(c.Query("q"))
+	if q == "" {
+		basichttp.OK(c, gin.H{"users": []gin.H{}})
+		return
+	}
+	if len(q) > 32 {
+		q = q[:32]
+	}
+	escaped := userListLikeEscaper.Replace(q)
+	pattern := escaped + "%"
+
+	var users []model.User
+	h.db.Select("id, username, display_name, avatar_url").
+		Where("username LIKE ? ESCAPE '\\' AND deleted_at IS NULL", pattern).
+		Order("username ASC").
+		Limit(10).
+		Find(&users)
+
+	result := make([]gin.H, 0, len(users))
+	for _, u := range users {
+		var displayName any
+		if u.DisplayName != nil {
+			displayName = *u.DisplayName
+		}
+		result = append(result, gin.H{
+			"id":           u.ID,
+			"username":     u.Username,
+			"display_name": displayName,
+			"avatar_url":   u.AvatarURL,
+		})
+	}
+	basichttp.OK(c, gin.H{"users": result})
 }

@@ -80,6 +80,10 @@ func AutoMigrate(db *gorm.DB) error {
 		&model.ExternalIdentity{},
 		&model.Post{},
 		&model.PostImage{},
+		&model.PostLike{},
+		&model.PostMention{},
+		&model.UserFollow{},
+		&model.UserBlock{},
 		&model.Comment{},
 		&model.Announcement{},
 		&model.UserPermission{},
@@ -121,6 +125,10 @@ func AutoMigrate(db *gorm.DB) error {
 
 	if err := ensurePerformanceIndexes(db); err != nil {
 		return fmt.Errorf("ensure performance indexes: %w", err)
+	}
+
+	if err := migrateToXStyle(db); err != nil {
+		return fmt.Errorf("migrate to X-style: %w", err)
 	}
 
 	return nil
@@ -499,9 +507,121 @@ func dropRequestLogsTable(db *gorm.DB) error {
 	return nil
 }
 
-// dropOldAnnouncementsTable removes the old title-based announcements table
-// and prepares for the new path-based schema (v4.0)
-// NOTE: This function uses SQLite-specific queries (sqlite_master, PRAGMA)
+// migrateToXStyle migrates existing Comment data to Post records (as replies)
+// and ensures all X-style indexes exist. Idempotent: checks if migration already ran.
+func migrateToXStyle(db *gorm.DB) error {
+	// Check if migration already ran by looking for a sentinel: any post with reply_to_id set
+	var migratedCount int64
+	db.Model(&model.Post{}).Where("reply_to_id IS NOT NULL").Count(&migratedCount)
+
+	// Also check if comments table has any rows to migrate
+	var commentCount int64
+	if err := db.Model(&model.Comment{}).Count(&commentCount).Error; err != nil {
+		commentCount = 0
+	}
+
+	if commentCount > 0 && migratedCount == 0 {
+		log.Println("Migrating comments to X-style post replies...")
+		if err := migrateCommentsToPostReplies(db); err != nil {
+			return fmt.Errorf("migrate comments to post replies: %w", err)
+		}
+		log.Println("Comment migration completed successfully")
+	} else if commentCount == 0 {
+		log.Println("No comments to migrate, skipping X-style comment migration")
+	} else {
+		log.Println("X-style comment migration already applied, skipping")
+	}
+
+	// Ensure X-style indexes
+	xIndexes := []string{
+		"CREATE INDEX IF NOT EXISTS idx_posts_reply_to_id ON posts(reply_to_id) WHERE reply_to_id IS NOT NULL",
+		"CREATE INDEX IF NOT EXISTS idx_posts_repost_of_id ON posts(repost_of_id) WHERE repost_of_id IS NOT NULL",
+		"CREATE INDEX IF NOT EXISTS idx_posts_quote_of_id ON posts(quote_of_id) WHERE quote_of_id IS NOT NULL",
+		"CREATE INDEX IF NOT EXISTS idx_post_mentions_post_id ON post_mentions(post_id)",
+		"CREATE INDEX IF NOT EXISTS idx_post_mentions_mentioned_user ON post_mentions(mentioned_user_id)",
+		"CREATE INDEX IF NOT EXISTS idx_user_follows_follower ON user_follows(follower_id)",
+		"CREATE INDEX IF NOT EXISTS idx_user_follows_following ON user_follows(following_id)",
+		"CREATE INDEX IF NOT EXISTS idx_user_blocks_blocker ON user_blocks(blocker_id)",
+		"CREATE INDEX IF NOT EXISTS idx_user_blocks_blocked ON user_blocks(blocked_id)",
+	}
+	for _, stmt := range xIndexes {
+		if err := db.Exec(stmt).Error; err != nil {
+			return fmt.Errorf("create X-style index: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// migrateCommentsToPostReplies converts each Comment into a Post with reply_to_id.
+func migrateCommentsToPostReplies(db *gorm.DB) error {
+	const batchSize = 100
+	offset := 0
+
+	for {
+		var comments []model.Comment
+		if err := db.Order("created_at ASC").Offset(offset).Limit(batchSize).Find(&comments).Error; err != nil {
+			return fmt.Errorf("fetch comments batch: %w", err)
+		}
+		if len(comments) == 0 {
+			break
+		}
+
+		tx := db.Begin()
+		for _, cmt := range comments {
+			replyToID := cmt.PostID
+			mode := "self"
+			cardType := "social"
+			p := model.Post{
+				AuthorID:      cmt.UserID,
+				AuthorName:    "",
+				TargetName:    "",
+				Content:       cmt.Content,
+				ReplyToID:     &replyToID,
+				Status:        cmt.Status,
+				AuditStatus:   cmt.AuditStatus,
+				ConfessorMode: &mode,
+				CardType:      &cardType,
+			}
+			if err := tx.Create(&p).Error; err != nil {
+				tx.Rollback()
+				return fmt.Errorf("create reply post for comment %s: %w", cmt.ID, err)
+			}
+			// Preserve original timestamps
+			tx.Model(&p).Updates(map[string]any{
+				"created_at": cmt.CreatedAt,
+				"updated_at": cmt.UpdatedAt,
+			})
+		}
+		if err := tx.Commit().Error; err != nil {
+			return fmt.Errorf("commit comment migration batch: %w", err)
+		}
+		offset += batchSize
+	}
+
+	// Update reply counts on parent posts
+	if err := db.Exec(`
+		UPDATE posts SET reply_count = (
+			SELECT COUNT(*) FROM posts AS replies
+			WHERE replies.reply_to_id = posts.id
+			AND replies.deleted_at IS NULL
+			AND replies.status = 0
+		) WHERE deleted_at IS NULL
+	`).Error; err != nil {
+		return fmt.Errorf("update reply counts: %w", err)
+	}
+
+	// Copy comment_count to reply_count for posts that had comments
+	if err := db.Exec(`
+		UPDATE posts SET reply_count = comment_count
+		WHERE comment_count > reply_count AND reply_to_id IS NULL AND deleted_at IS NULL
+	`).Error; err != nil {
+		log.Printf("WARNING: failed to sync comment_count to reply_count: %v", err)
+	}
+
+	return nil
+}
+
 func dropOldAnnouncementsTable(db *gorm.DB) error {
 	// Check if announcements table exists with old schema (has 'title' column)
 	var columns []struct {

@@ -85,11 +85,60 @@ func moderatePostV2(db *gorm.DB, cfg aiConfigProvider, id string) {
 			"card_type":       cardType,
 		})
 
+		wasVisible := p.Status == 0
+
 		tx := db.Begin()
-		_ = tx.Unscoped().Where("post_id = ?", id).Delete(&model.Comment{}).Error
-		_ = tx.Unscoped().Where("post_id = ?", id).Delete(&model.PostImage{}).Error
-		_ = tx.Unscoped().Delete(&p).Error
-		_ = tx.Commit().Error
+		if tx.Error != nil {
+			return
+		}
+		// Decrement parent counts if post was visible
+		if wasVisible {
+			if p.ReplyToID != nil && *p.ReplyToID != "" {
+				if err := tx.Model(&model.Post{}).Where("id = ?", *p.ReplyToID).Update("reply_count", gorm.Expr("CASE WHEN reply_count > 0 THEN reply_count - 1 ELSE 0 END")).Error; err != nil {
+					tx.Rollback()
+					return
+				}
+			}
+			if p.RepostOfID != nil && *p.RepostOfID != "" {
+				if err := tx.Model(&model.Post{}).Where("id = ?", *p.RepostOfID).Update("repost_count", gorm.Expr("CASE WHEN repost_count > 0 THEN repost_count - 1 ELSE 0 END")).Error; err != nil {
+					tx.Rollback()
+					return
+				}
+			}
+			if p.QuoteOfID != nil && *p.QuoteOfID != "" {
+				if err := tx.Model(&model.Post{}).Where("id = ?", *p.QuoteOfID).Update("quote_count", gorm.Expr("CASE WHEN quote_count > 0 THEN quote_count - 1 ELSE 0 END")).Error; err != nil {
+					tx.Rollback()
+					return
+				}
+			}
+		}
+		if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.Comment{}).Error; err != nil {
+			tx.Rollback()
+			return
+		}
+		if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.PostImage{}).Error; err != nil {
+			tx.Rollback()
+			return
+		}
+		if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.PostLike{}).Error; err != nil {
+			tx.Rollback()
+			return
+		}
+		if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.PostMention{}).Error; err != nil {
+			tx.Rollback()
+			return
+		}
+		if err := tx.Unscoped().Where("post_id = ?", id).Delete(&model.PostView{}).Error; err != nil {
+			tx.Rollback()
+			return
+		}
+		if err := tx.Unscoped().Delete(&p).Error; err != nil {
+			tx.Rollback()
+			return
+		}
+		if err := tx.Commit().Error; err != nil {
+			return
+		}
 		reason := msg
 		if reason == "" {
 			reason = "评分低于 56 分，已删除"
@@ -163,7 +212,46 @@ func moderatePostV2(db *gorm.DB, cfg aiConfigProvider, id string) {
 		"target_name":     p.TargetName,
 	})
 
-	_ = db.Model(&model.Post{}).Where("id = ?", id).Updates(map[string]any{"status": 0, "audit_status": 0, "audit_msg": nil, "manual_review_requested": false}).Error
+	wasHidden := p.Status != 0
+
+	tx := db.Begin()
+	if tx.Error != nil {
+		return
+	}
+
+	if err := tx.Model(&model.Post{}).Where("id = ?", id).Updates(map[string]any{"status": 0, "audit_status": 0, "audit_msg": nil, "manual_review_requested": false}).Error; err != nil {
+		tx.Rollback()
+		return
+	}
+
+	// Only increment counts if post was previously hidden
+	if wasHidden {
+		// If this is a reply, increment parent's reply_count
+		if p.ReplyToID != nil && *p.ReplyToID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.ReplyToID).Update("reply_count", gorm.Expr("reply_count + 1")).Error; err != nil {
+				tx.Rollback()
+				return
+			}
+		}
+		// If this is a repost, increment parent's repost_count
+		if p.RepostOfID != nil && *p.RepostOfID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.RepostOfID).Update("repost_count", gorm.Expr("repost_count + 1")).Error; err != nil {
+				tx.Rollback()
+				return
+			}
+		}
+		// If this is a quote, increment parent's quote_count
+		if p.QuoteOfID != nil && *p.QuoteOfID != "" {
+			if err := tx.Model(&model.Post{}).Where("id = ?", *p.QuoteOfID).Update("quote_count", gorm.Expr("quote_count + 1")).Error; err != nil {
+				tx.Rollback()
+				return
+			}
+		}
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return
+	}
 }
 
 func moderateCommentV2(db *gorm.DB, cfg aiConfigProvider, id string) {
@@ -178,10 +266,29 @@ func moderateCommentV2(db *gorm.DB, cfg aiConfigProvider, id string) {
 		"post_id":         cmt.PostID,
 	})
 
+	wasHidden := cmt.Status != 0
+
 	tx := db.Begin()
-	_ = tx.Model(&model.Comment{}).Where("id = ?", id).Updates(map[string]any{"status": 0, "audit_status": 0, "audit_msg": nil}).Error
-	_ = tx.Model(&model.Post{}).Where("id = ?", cmt.PostID).Update("comment_count", gorm.Expr("comment_count + 1")).Error
-	_ = tx.Commit().Error
+	if tx.Error != nil {
+		return
+	}
+
+	if err := tx.Model(&model.Comment{}).Where("id = ?", id).Updates(map[string]any{"status": 0, "audit_status": 0, "audit_msg": nil}).Error; err != nil {
+		tx.Rollback()
+		return
+	}
+
+	// Only increment count if comment was previously hidden
+	if wasHidden {
+		if err := tx.Model(&model.Post{}).Where("id = ?", cmt.PostID).Update("comment_count", gorm.Expr("comment_count + 1")).Error; err != nil {
+			tx.Rollback()
+			return
+		}
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return
+	}
 }
 
 func moderatePost(db *gorm.DB, cfg aiConfigProvider, id string) {
