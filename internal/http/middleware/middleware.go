@@ -201,6 +201,54 @@ func RequireAuth(secret string) gin.HandlerFunc {
 	}
 }
 
+// OptionalAuth is like RequireAuth but doesn't fail if token is missing.
+// If a valid token is provided, it sets the user context; otherwise, the request continues unauthenticated.
+func OptionalAuth(secret string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tokenStr := ""
+		hdr := c.GetHeader("Authorization")
+		if strings.HasPrefix(strings.ToLower(hdr), "bearer ") {
+			tokenStr = strings.TrimSpace(hdr[7:])
+		}
+		if tokenStr == "" {
+			if ck, err := c.Cookie("auth_token"); err == nil {
+				tokenStr = ck
+			}
+		}
+		// If no token, continue without auth
+		if tokenStr == "" {
+			c.Next()
+			return
+		}
+		// If token is blacklisted, continue without auth (don't fail)
+		if IsTokenBlacklisted(tokenStr) {
+			c.Next()
+			return
+		}
+		// Try to parse token
+		token, err := jwt.ParseWithClaims(tokenStr, &UserClaims{}, func(t *jwt.Token) (interface{}, error) {
+			return []byte(secret), nil
+		})
+		if err != nil || !token.Valid {
+			// Invalid token: continue without auth (don't fail)
+			c.Next()
+			return
+		}
+		// Valid token: set user context
+		claims := token.Claims.(*UserClaims)
+		c.Set(CtxUserID, claims.Sub)
+		c.Set(CtxIsSuper, claims.IsSuperadmin)
+		if claims.ExpiresAt != nil {
+			c.Set(CtxTokenExp, claims.ExpiresAt.Time)
+		}
+		if claims.ID != "" {
+			c.Set(CtxTokenJTI, claims.ID)
+		}
+		c.Set(CtxTokenStr, tokenStr)
+		c.Next()
+	}
+}
+
 // IsSuperCached reads superadmin status from JWT (cached, may be stale)
 func IsSuperCached(c *gin.Context) bool {
 	v, ok := c.Get(CtxIsSuper)

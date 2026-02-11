@@ -317,17 +317,23 @@ func (h *PostHandler) ListPosts(c *gin.Context) {
 
 	feed := strings.TrimSpace(c.Query("feed"))
 
+	// Check if user is authenticated (for optional features)
+	uid, isAuthenticated := c.Get(mw.CtxUserID)
+	var uidStr string
+	if isAuthenticated {
+		uidStr = uid.(string)
+	}
+
 	// Base query: only top-level posts (not replies, not reposts)
 	q := h.db.Model(&model.Post{}).Where("status = 0 AND deleted_at IS NULL AND reply_to_id IS NULL AND repost_of_id IS NULL")
 
-	// Feed filtering (requires auth)
-	if feed == "following" || feed == "recommended" {
-		uid, exists := c.Get(mw.CtxUserID)
-		if !exists {
-			basichttp.Fail(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required for feed filtering")
+	// Feed filtering
+	if feed == "following" {
+		// Following feed requires authentication
+		if !isAuthenticated {
+			basichttp.Fail(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required for following feed")
 			return
 		}
-		uidStr := uid.(string)
 
 		// Get blocked user IDs
 		var blockedIDs []string
@@ -340,20 +346,49 @@ func (h *PostHandler) ListPosts(c *gin.Context) {
 			q = q.Where("author_id NOT IN ?", blockedIDs)
 		}
 
-		if feed == "following" {
-			// Following feed: posts from users I follow
-			var followingIDs []string
-			h.db.Model(&model.UserFollow{}).
-				Where("follower_id = ? AND deleted_at IS NULL", uidStr).
-				Pluck("following_id", &followingIDs)
-			if len(followingIDs) == 0 {
-				// No following, return empty
-				basichttp.OK(c, gin.H{"total": 0, "items": []gin.H{}, "page": page, "page_size": size})
-				return
-			}
-			q = q.Where("author_id IN ?", followingIDs)
+		// Following feed: posts from users I follow
+		var followingIDs []string
+		h.db.Model(&model.UserFollow{}).
+			Where("follower_id = ? AND deleted_at IS NULL", uidStr).
+			Pluck("following_id", &followingIDs)
+		if len(followingIDs) == 0 {
+			// No following, return empty
+			basichttp.OK(c, gin.H{"total": 0, "items": []gin.H{}, "page": page, "page_size": size})
+			return
 		}
-		// "recommended" = all posts (excluding blocked), no additional filter
+		q = q.Where("author_id IN ?", followingIDs)
+		// Sort following feed by time (most recent first)
+		q = q.Order("created_at DESC")
+	} else if feed == "recommended" {
+		// Recommended feed: exclude blocked users if authenticated
+		if isAuthenticated {
+			var blockedIDs []string
+			h.db.Model(&model.UserBlock{}).
+				Where("blocker_id = ? AND deleted_at IS NULL", uidStr).
+				Pluck("blocked_id", &blockedIDs)
+			if len(blockedIDs) > 0 {
+				q = q.Where("author_id NOT IN ?", blockedIDs)
+			}
+		}
+		// X.com-style ranking: engagement score = (like_count * 3) + (reply_count * 2) + (repost_count * 2) + (quote_count * 1.5)
+		// Combined with recency decay: newer posts get boost
+		q = q.Order(`
+			(like_count * 3 + reply_count * 2 + repost_count * 2 + quote_count * 1.5) *
+			(1.0 / (1.0 + (julianday('now') - julianday(created_at)) * 0.5)) DESC
+		`)
+	} else {
+		// Default feed: exclude blocked users if authenticated
+		if isAuthenticated {
+			var blockedIDs []string
+			h.db.Model(&model.UserBlock{}).
+				Where("blocker_id = ? AND deleted_at IS NULL", uidStr).
+				Pluck("blocked_id", &blockedIDs)
+			if len(blockedIDs) > 0 {
+				q = q.Where("author_id NOT IN ?", blockedIDs)
+			}
+		}
+		// Sort by priority: pinned+featured > pinned > featured > normal, then by time
+		q = q.Order("is_pinned DESC, is_featured DESC, created_at DESC")
 	}
 
 	if v := c.Query("featured"); v == "true" {
@@ -363,15 +398,18 @@ func (h *PostHandler) ListPosts(c *gin.Context) {
 		q = q.Where("is_pinned = ?", true)
 	}
 	q.Count(&total)
-	// Sort by priority: pinned+featured > pinned > featured > normal, then by time
-	q = q.Order("is_pinned DESC, is_featured DESC, created_at DESC").Offset((page - 1) * size).Limit(size)
+	q = q.Offset((page - 1) * size).Limit(size)
 	if err := q.Find(&items).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "query failed")
 		return
 	}
+
+	// Enrich posts with user tags and like status
+	enrichedItems := h.enrichPostsWithUserTagsAndLikes(items, c, isAuthenticated, uidStr)
+
 	basichttp.OK(c, gin.H{
 		"total":     total,
-		"items":     h.enrichPostsWithUserTagsCtx(items, c),
+		"items":     enrichedItems,
 		"page":      page,
 		"page_size": size,
 	})
@@ -1932,4 +1970,12 @@ func (h *PostHandler) ListUserReplies(c *gin.Context) {
 		return
 	}
 	basichttp.OK(c, gin.H{"total": total, "items": h.enrichPostsWithUserTagsCtx(items, c), "page": page, "page_size": size})
+}
+
+// enrichPostsWithUserTagsAndLikes is a wrapper that enriches posts with user tags and like status
+// It accepts explicit authentication parameters instead of relying only on context
+func (h *PostHandler) enrichPostsWithUserTagsAndLikes(posts []model.Post, c *gin.Context, isAuthenticated bool, uidStr string) []gin.H {
+	// The existing enrichPostsWithUserTagsCtx already handles liked_by_me via context
+	// So we can just call it directly since we don't need to override the behavior
+	return h.enrichPostsWithUserTagsCtx(posts, c)
 }
