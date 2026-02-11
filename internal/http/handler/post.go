@@ -258,12 +258,12 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 		AuthorName:    authorName,
 		TargetName:    targetName,
 		Content:       form.Content,
-		Status:        1,
+		Status:        0, // No moderation: directly visible
 		IsPinned:      false,
 		IsFeatured:    false,
 		ConfessorMode: &mode,
 		CardType:      &cardType,
-		AuditStatus:   1,
+		AuditStatus:   0, // No audit needed
 		AuditMsg:      nil,
 		ReplyToID:     replyToID,
 		RepostOfID:    repostOfID,
@@ -273,6 +273,25 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "create post failed")
 		return
 	}
+
+	// Use transaction to update parent counts atomically
+	tx := h.db.Begin()
+	if tx.Error == nil {
+		// Increment reply_count if this is a reply
+		if replyToID != nil && *replyToID != "" {
+			_ = tx.Model(&model.Post{}).Where("id = ?", *replyToID).Update("reply_count", gorm.Expr("reply_count + 1")).Error
+		}
+		// Increment repost_count if this is a repost
+		if repostOfID != nil && *repostOfID != "" {
+			_ = tx.Model(&model.Post{}).Where("id = ?", *repostOfID).Update("repost_count", gorm.Expr("repost_count + 1")).Error
+		}
+		// Increment quote_count if this is a quote
+		if quoteOfID != nil && *quoteOfID != "" {
+			_ = tx.Model(&model.Post{}).Where("id = ?", *quoteOfID).Update("quote_count", gorm.Expr("quote_count + 1")).Error
+		}
+		_ = tx.Commit().Error
+	}
+
 	// Save PostImage rows if any
 	if len(imageURLs) > 0 {
 		imgs := make([]model.PostImage, 0, len(imageURLs))
@@ -281,7 +300,6 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 		}
 		_ = h.db.Create(&imgs).Error
 	}
-	// Note: repost_count and quote_count will be incremented when the post is approved
 	// Parse @mentions and create records
 	if !isRepost && strings.TrimSpace(form.Content) != "" {
 		service.CreateMentions(h.db, p.ID, uidStr, form.Content)
@@ -299,10 +317,9 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 			}
 		}
 	}
-	// Log submission
+	// Log submission (keep for operation tracking, not moderation)
 	service.LogSubmission(h.db, uidStr, "post_create", "post", p.ID, map[string]any{"target_name": p.TargetName, "ip": c.ClientIP()})
-	// Enqueue async moderation
-	service.EnqueuePostModeration(p.ID)
+	// No moderation needed
 	basichttp.JSON(c, http.StatusCreated, h.enrichPostWithUserTag(p))
 }
 
@@ -1316,57 +1333,13 @@ func (h *PostHandler) Update(c *gin.Context) {
 		return
 	}
 
-	wasVisible := p.Status == 0
-
-	tx := h.db.Begin()
-	if tx.Error != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "transaction failed")
-		return
-	}
-
-	// Apply updates and set pending moderation again
-	updates["status"] = 1
-	updates["audit_status"] = 1
-	updates["audit_msg"] = nil
-	updates["manual_review_requested"] = false
-	if err := tx.Model(&model.Post{}).Where("id = ?", id).Updates(updates).Error; err != nil {
-		tx.Rollback()
+	// No moderation: just update the post, keep status as is
+	if err := h.db.Model(&model.Post{}).Where("id = ?", id).Updates(updates).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
 		return
 	}
 
-	// If post was visible and is now pending review, decrement parent counts
-	if wasVisible {
-		if p.ReplyToID != nil && *p.ReplyToID != "" {
-			if err := tx.Model(&model.Post{}).Where("id = ?", *p.ReplyToID).Update("reply_count", gorm.Expr("CASE WHEN reply_count > 0 THEN reply_count - 1 ELSE 0 END")).Error; err != nil {
-				tx.Rollback()
-				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
-				return
-			}
-		}
-		if p.RepostOfID != nil && *p.RepostOfID != "" {
-			if err := tx.Model(&model.Post{}).Where("id = ?", *p.RepostOfID).Update("repost_count", gorm.Expr("CASE WHEN repost_count > 0 THEN repost_count - 1 ELSE 0 END")).Error; err != nil {
-				tx.Rollback()
-				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
-				return
-			}
-		}
-		if p.QuoteOfID != nil && *p.QuoteOfID != "" {
-			if err := tx.Model(&model.Post{}).Where("id = ?", *p.QuoteOfID).Update("quote_count", gorm.Expr("CASE WHEN quote_count > 0 THEN quote_count - 1 ELSE 0 END")).Error; err != nil {
-				tx.Rollback()
-				basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
-				return
-			}
-		}
-	}
-
-	if err := tx.Commit().Error; err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
-		return
-	}
-
-	// enqueue moderation
-	service.EnqueuePostModeration(id)
+	// No moderation needed
 	if err := h.db.First(&p, "id = ?", id).Error; err == nil {
 		basichttp.OK(c, p)
 	} else {

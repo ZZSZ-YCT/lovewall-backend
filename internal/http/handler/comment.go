@@ -219,20 +219,20 @@ func (h *CommentHandler) Create(c *gin.Context) {
 		PostID:      postID,
 		UserID:      uid.(string),
 		Content:     body.Content,
-		Status:      1, // hidden pending moderation
-		AuditStatus: 1,
+		Status:      0, // No moderation: directly visible
+		AuditStatus: 0,
 	}
 	if err := h.db.Create(cm).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "create failed")
 		return
 	}
-	// Do not increment comment_count yet; will increment when moderation approves
-	// Log submission
+	// Increment comment_count immediately
+	_ = h.db.Model(&model.Post{}).Where("id = ?", postID).Update("comment_count", gorm.Expr("comment_count + 1")).Error
+	// Log submission (keep for operation tracking)
 	if uidStr, ok2 := uid.(string); ok2 {
 		service.LogSubmission(h.db, uidStr, "comment_create", "comment", cm.ID, map[string]any{"post_id": cm.PostID, "ip": c.ClientIP()})
 	}
-	// enqueue async moderation
-	service.EnqueueCommentModeration(cm.ID)
+	// No moderation needed
 	basichttp.JSON(c, http.StatusCreated, cm)
 }
 
@@ -332,35 +332,12 @@ func (h *CommentHandler) Update(c *gin.Context) {
 		basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "评论长度超过限制")
 		return
 	}
-	// set pending moderation again; if previously visible, decrement post comment_count
-	wasVisible := (cm.Status == 0)
-
-	tx := h.db.Begin()
-	if tx.Error != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "transaction failed")
-		return
-	}
-
-	if err := tx.Model(&model.Comment{}).Where("id = ?", id).Updates(map[string]any{"content": *body.Content, "status": 1, "audit_status": 1, "audit_msg": nil}).Error; err != nil {
-		tx.Rollback()
+	// No moderation: just update the content, keep status as is
+	if err := h.db.Model(&model.Comment{}).Where("id = ?", id).Update("content", *body.Content).Error; err != nil {
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update failed")
 		return
 	}
-
-	if wasVisible {
-		if err := tx.Model(&model.Post{}).Where("id = ?", cm.PostID).Update("comment_count", gorm.Expr("CASE WHEN comment_count > 0 THEN comment_count - 1 ELSE 0 END")).Error; err != nil {
-			tx.Rollback()
-			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
-			return
-		}
-	}
-
-	if err := tx.Commit().Error; err != nil {
-		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
-		return
-	}
-	// enqueue moderation
-	service.EnqueueCommentModeration(id)
+	// No moderation needed
 	// Log operation if edited by non-author (admin/moderator)
 	if uidStr, ok := (func() (string, bool) {
 		v, ok := c.Get(mw.CtxUserID)
