@@ -104,6 +104,11 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 			basichttp.Fail(c, http.StatusUnprocessableEntity, "VALIDATION_FAILED", "cannot reply to hidden post")
 			return
 		}
+		// Check if post is locked
+		if target.IsLocked {
+			basichttp.Fail(c, http.StatusForbidden, "POST_LOCKED", "cannot reply to locked post")
+			return
+		}
 		id := strings.TrimSpace(form.ReplyToID)
 		replyToID = &id
 	}
@@ -113,6 +118,16 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 			basichttp.Fail(c, http.StatusNotFound, "NOT_FOUND", "repost target not found")
 			return
 		}
+
+		// Check if user has already reposted this post
+		var existingRepost model.Post
+		err := h.db.Where("author_id = ? AND repost_of_id = ? AND deleted_at IS NULL", uidStr, strings.TrimSpace(form.RepostOfID)).First(&existingRepost).Error
+		if err == nil {
+			// Already reposted - return conflict
+			basichttp.Fail(c, http.StatusConflict, "ALREADY_REPOSTED", "you have already reposted this post")
+			return
+		}
+
 		id := strings.TrimSpace(form.RepostOfID)
 		repostOfID = &id
 	}
@@ -269,27 +284,48 @@ func (h *PostHandler) CreatePost(c *gin.Context) {
 		RepostOfID:    repostOfID,
 		QuoteOfID:     quoteOfID,
 	}
-	if err := h.db.Create(p).Error; err != nil {
+
+	// Use transaction to create post and update parent counts atomically
+	tx := h.db.Begin()
+	if tx.Error != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "transaction failed")
+		return
+	}
+
+	if err := tx.Create(p).Error; err != nil {
+		tx.Rollback()
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "create post failed")
 		return
 	}
 
-	// Use transaction to update parent counts atomically
-	tx := h.db.Begin()
-	if tx.Error == nil {
-		// Increment reply_count if this is a reply
-		if replyToID != nil && *replyToID != "" {
-			_ = tx.Model(&model.Post{}).Where("id = ?", *replyToID).Update("reply_count", gorm.Expr("reply_count + 1")).Error
+	// Increment reply_count if this is a reply
+	if replyToID != nil && *replyToID != "" {
+		if err := tx.Model(&model.Post{}).Where("id = ?", *replyToID).Update("reply_count", gorm.Expr("reply_count + 1")).Error; err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+			return
 		}
-		// Increment repost_count if this is a repost
-		if repostOfID != nil && *repostOfID != "" {
-			_ = tx.Model(&model.Post{}).Where("id = ?", *repostOfID).Update("repost_count", gorm.Expr("repost_count + 1")).Error
+	}
+	// Increment repost_count if this is a repost
+	if repostOfID != nil && *repostOfID != "" {
+		if err := tx.Model(&model.Post{}).Where("id = ?", *repostOfID).Update("repost_count", gorm.Expr("repost_count + 1")).Error; err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+			return
 		}
-		// Increment quote_count if this is a quote
-		if quoteOfID != nil && *quoteOfID != "" {
-			_ = tx.Model(&model.Post{}).Where("id = ?", *quoteOfID).Update("quote_count", gorm.Expr("quote_count + 1")).Error
+	}
+	// Increment quote_count if this is a quote
+	if quoteOfID != nil && *quoteOfID != "" {
+		if err := tx.Model(&model.Post{}).Where("id = ?", *quoteOfID).Update("quote_count", gorm.Expr("quote_count + 1")).Error; err != nil {
+			tx.Rollback()
+			basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "update count failed")
+			return
 		}
-		_ = tx.Commit().Error
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "commit failed")
+		return
 	}
 
 	// Save PostImage rows if any
@@ -1731,6 +1767,13 @@ func (h *PostHandler) LikePost(c *gin.Context) {
 	like := &model.PostLike{UserID: uidStr, PostID: postID}
 	if err := tx.Create(like).Error; err != nil {
 		tx.Rollback()
+		// Check if it's a unique constraint violation (already liked in concurrent request)
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "UNIQUE constraint") || strings.Contains(errMsg, "duplicate key") || strings.Contains(errMsg, "Duplicate entry") {
+			// Concurrent like detected - return success (idempotent)
+			basichttp.OK(c, gin.H{"liked": true, "message": "already liked"})
+			return
+		}
 		basichttp.Fail(c, http.StatusInternalServerError, "INTERNAL_ERROR", "like failed")
 		return
 	}
