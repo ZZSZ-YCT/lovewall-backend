@@ -130,7 +130,7 @@ func main() {
 	// Public: follow/follower lists
 	api.GET("/users/:id/followers", followH.ListFollowers)
 	api.GET("/users/:id/following", followH.ListFollowing)
-	api.GET("/posts", postH.ListPosts)
+	api.GET("/posts", mw.OptionalAuth(cfg.JWTSecret), postH.ListPosts)
 	api.GET("/posts/:id", postH.GetPost)
 	api.GET("/posts/:id/lock-status", postH.GetPostLockStatus)
 	api.GET("/users/:id/posts", postH.ListByUser)
